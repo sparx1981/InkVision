@@ -92,6 +92,58 @@ export async function extractMaskedPatch(baseSrc: string, resultSrc: string, box
 }
 
 /**
+ * Computes the actual sub-rectangle a design occupies within a user-drawn
+ * placement box, using the same "object-fit: contain" math the on-screen
+ * PlacementBoxEditor preview already uses to render `designSrc` inside `box`
+ * (`w-full h-full object-contain`) — scaled uniformly to fit entirely inside
+ * the box, centered, with any leftover space on one axis left as a letterboxed
+ * gap rather than stretched to fill it.
+ *
+ * This matters because the box the user drags/resizes and the design's own
+ * aspect ratio are frequently different shapes — every Stage-A AI-generated
+ * design is a fixed 1:1 square (see /api/generate-tattoo-design), while the
+ * box can be any shape the user drew — so "the box" and "where the design is
+ * actually visible" are two different rectangles whenever they don't match.
+ * Everything downstream that needs to know where the design REALLY sits
+ * (the burned-in placement marker, the prompt's region description, the
+ * feather mask / final crop) should use this rect, not the raw box, or the
+ * AI ends up filling the entire box — including the letterboxed margin the
+ * user never actually placed anything in.
+ *
+ * Box coordinates are percentages relative to the base photo, but percentage
+ * width/height alone don't capture true on-screen aspect ratio (width% is a
+ * fraction of the photo's width, height% a fraction of its height) — so this
+ * converts to real pixels using the base photo's actual dimensions before
+ * doing the contain-fit math, then converts the result back to percentages
+ * in that same coordinate space.
+ */
+export async function computeContainBox(baseSrc: string, designSrc: string, box: Box): Promise<Box> {
+  const [baseImg, designImg] = await Promise.all([loadImage(baseSrc), loadImage(designSrc)]);
+  const imgW = baseImg.naturalWidth || baseImg.width;
+  const imgH = baseImg.naturalHeight || baseImg.height;
+  const designW = designImg.naturalWidth || designImg.width;
+  const designH = designImg.naturalHeight || designImg.height;
+
+  const boxXpx = (box.x / 100) * imgW;
+  const boxYpx = (box.y / 100) * imgH;
+  const boxWpx = (box.width / 100) * imgW;
+  const boxHpx = (box.height / 100) * imgH;
+
+  const scale = Math.min(boxWpx / designW, boxHpx / designH);
+  const containWpx = designW * scale;
+  const containHpx = designH * scale;
+  const containXpx = boxXpx + (boxWpx - containWpx) / 2;
+  const containYpx = boxYpx + (boxHpx - containHpx) / 2;
+
+  return {
+    x: (containXpx / imgW) * 100,
+    y: (containYpx / imgH) * 100,
+    width: (containWpx / imgW) * 100,
+    height: (containHpx / imgH) * 100
+  };
+}
+
+/**
  * Burns a visible marker for the placement box directly onto the actual pixels
  * of a copy of the base photo, so the AI can SEE the target region instead of
  * only reading a text description of it (percentages parsed from prose are a

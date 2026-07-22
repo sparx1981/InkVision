@@ -14,7 +14,7 @@ import {
 } from "./types";
 import { PROMPT_SUGGESTIONS } from "./data/defaultAssets";
 import { generateTattooStencil } from "./utils/stencil";
-import { getImageOrientation, extractMaskedPatch, compositePatchWithAdjust, transformDesignGraphic, burnPlacementMarker } from "./utils/imageCompose";
+import { getImageOrientation, extractMaskedPatch, compositePatchWithAdjust, transformDesignGraphic, burnPlacementMarker, computeContainBox } from "./utils/imageCompose";
 import { generateShareQrCode, buildTattooistShareUrl, downloadProjectZip, downloadImagesZip } from "./utils/tattooistShare";
 import TattooStage from "./components/TattooStage";
 import TattooControlPanel from "./components/TattooControlPanel";
@@ -484,16 +484,24 @@ export default function App() {
   // ---------------------------------------------------------------------
   // Phase 1 — Analyze / Confirm
   // ---------------------------------------------------------------------
-  // Runs the vision analysis silently the first time it's actually needed
-  // (first Generate, first Inspire Me, first Multi-Pose Reference) instead of
-  // as a separate blocking step before Step 02 unlocks. Returns the result
-  // directly (rather than relying on state, which updates asynchronously) so
-  // callers can use it immediately without a stale-closure risk.
-  const ensureAnalysis = async (): Promise<TattooAnalysis | null> => {
+  // Fired automatically in the background the moment a photo becomes active
+  // (see the useEffect below), instead of being awaited synchronously the
+  // first time Generate/Inspire Me/Multi-Pose Reference needs it. That used
+  // to put a live Gemini call directly in the critical path of every single
+  // "Generate Preview" click — if the analysis call is what happened to hit
+  // Google's occasional transient instability, the whole generation attempt
+  // felt like it failed even though nothing about generation itself was
+  // broken. Now it's already cached in `analysisState` (or has already
+  // failed quietly) well before the user gets there. Still safe to call
+  // on-demand too (Inspire Me, Re-analyze, Multi-Pose Reference) — it
+  // short-circuits instantly on a cache hit, and only actually re-fetches if
+  // the background attempt hasn't finished or hasn't started yet (e.g. this
+  // is the very first photo and the effect hasn't run yet on this render).
+  const ensureAnalysis = async (opts: { silent?: boolean } = {}): Promise<TattooAnalysis | null> => {
     if (analysisState) return analysisState;
     if (!activePhoto) return null;
     setAnalyzing(true);
-    setError(null);
+    if (!opts.silent) setError(null);
     try {
       const otherAngles = basePhotos.filter((p) => p.id !== activePhotoId).map((p) => p.src);
       const images = [activePhoto.src, ...otherAngles].slice(0, 4);
@@ -517,12 +525,34 @@ export default function App() {
       setCorrectionText("");
       return result;
     } catch (err: any) {
-      setError(err.message || "Couldn't read your photo automatically — you can still describe your tattoo and generate.");
+      const message = err.message || "Couldn't read your photo automatically — you can still describe your tattoo and generate.";
+      if (opts.silent) {
+        // A background-triggered attempt shouldn't surface a persistent error
+        // banner before the user has even tried to do anything — the server
+        // already retries transient errors a couple of times on its own
+        // (see generateContentWithRetry), so a failure here means it's
+        // genuinely down. A quiet toast is enough; Generate still has its
+        // own fallback + notice if analysis never lands in time.
+        setToastMsg({ type: "error", text: "Couldn't analyze your photo automatically in the background — it'll use general context when you generate." });
+      } else {
+        setError(message);
+      }
       return null;
     } finally {
       setAnalyzing(false);
     }
   };
+
+  // Kicks analysis off the moment a photo becomes the active one (typically
+  // right after upload) rather than waiting for the user to click Generate —
+  // see the comment on ensureAnalysis above for why this moved out of the
+  // generate critical path.
+  useEffect(() => {
+    if (activePhotoId && !analysisState && !analyzing) {
+      ensureAnalysis({ silent: true });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activePhotoId, basePhotos.length]);
 
   const handleReanalyze = async () => {
     setAnalysisState(null);
@@ -557,14 +587,28 @@ export default function App() {
       saturation: angleAdjust.saturation
     });
 
-    // Burn the placement box directly onto a COPY of the base photo's pixels
-    // before it goes to the AI — a visual marker the model can actually see,
-    // instead of relying only on a text description of the region (see
-    // burnPlacementMarker's own comment for why). The untouched `baseForBlend`
-    // is still what every later step (masked patch extraction, Adjustments,
-    // history) is built from — only this one outgoing request uses the
-    // marked copy.
-    const markedBaseSrc = await burnPlacementMarker(baseForBlend, box);
+    // `box` is the raw rectangle the user dragged/resized — but the on-screen
+    // preview (PlacementBoxEditor) renders the design INSIDE that box with
+    // object-contain, not stretched to fill it, so whenever the design's own
+    // aspect ratio doesn't match the box's (the common case — Stage-A designs
+    // are always a fixed 1:1 square, box shapes are whatever the user drew),
+    // what the user actually saw and approved is a smaller, centered rect
+    // inside the box, not the box itself. Compute that same rect here and use
+    // it everywhere downstream that needs to know where the design REALLY
+    // sits — the burned-in marker, the prompt's region description, and the
+    // feather mask/final crop — so the AI is grounded on the design's actual
+    // placed bounds instead of the outer box (which used to make it fill the
+    // whole box, including the letterboxed margin nothing was placed in).
+    // `box` itself is left untouched for storage/re-editing (see entry below).
+    const containBox = await computeContainBox(baseForBlend, designSrc, box);
+
+    // Burn the marker onto a COPY of the base photo's pixels before it goes to
+    // the AI — a visual marker the model can actually see, instead of relying
+    // only on a text description of the region (see burnPlacementMarker's own
+    // comment for why). The untouched `baseForBlend` is still what every later
+    // step (masked patch extraction, Adjustments, history) is built from —
+    // only this one outgoing request uses the marked copy.
+    const markedBaseSrc = await burnPlacementMarker(baseForBlend, containBox);
 
     const res2 = await fetch("/api/composite-photorealistic", {
       method: "POST",
@@ -572,7 +616,7 @@ export default function App() {
       body: JSON.stringify({
         baseImage: markedBaseSrc,
         designImage: transformedDesignSrc,
-        placementBox: box,
+        placementBox: containBox,
         bodyPart: analysis.bodyPart,
         theme: analysis.theme,
         description: analysis.description,
@@ -590,13 +634,16 @@ export default function App() {
     const data2 = await safeJson(res2);
     if (!res2.ok) throw new Error(data2.error || `Failed to generate the composite for ${photo.name}.`);
 
-    // Hard guarantee (not just a prompt request): anything outside the box
+    // Hard guarantee (not just a prompt request): anything outside containBox
     // is pixel-identical to the original — masked once, final, nothing left
     // to move afterward (Reposition redraws + regenerates instead).
-    const patchSrc = await extractMaskedPatch(baseForBlend, data2.imageUrl, box);
-    const flattenedSrc = await compositePatchWithAdjust(baseForBlend, patchSrc, box, DEFAULT_ADJUST);
+    const patchSrc = await extractMaskedPatch(baseForBlend, data2.imageUrl, containBox);
+    const flattenedSrc = await compositePatchWithAdjust(baseForBlend, patchSrc, containBox, DEFAULT_ADJUST);
 
     const entry: AngleResult = {
+      // Stored as the raw user-drawn box, not containBox — re-opening this
+      // angle (Reposition) must show the box exactly as the user left it,
+      // not the shrunk contain-fit rect computed from it.
       placementBox: box,
       src: flattenedSrc,
       baseSrcForThisRound: baseForBlend
@@ -621,19 +668,25 @@ export default function App() {
     setGenerating(true);
     setError(null);
     try {
-      // Analysis runs here automatically if it hasn't already (e.g. via Inspire
-      // Me or Multi-Pose Reference). If it fails for any reason (API hiccup,
-      // quota, etc.) we don't hard-block generation — fall back to generic
-      // context and let the model infer body part/style from the photo it
-      // already receives directly, same as before analysis existed at all.
-      const analysis =
-        (await ensureAnalysis()) || {
-          bodyPart: "the marked body part shown in the reference photo",
-          theme: "unspecified — infer style and any existing ink directly from the reference photo",
-          description: ""
-        };
+      // Analysis already runs automatically in the background as soon as a
+      // photo is uploaded (see the useEffect above ensureAnalysis) — this just
+      // reads whatever's ready right now rather than awaiting it here, so a
+      // slow or flaky analysis call is never in the critical path of clicking
+      // Generate. If it hasn't finished (or never landed), fall back to
+      // generic context and let the model infer body part/style from the
+      // photo it already receives directly, same as before analysis existed.
+      const analysis = analysisState || {
+        bodyPart: "the marked body part shown in the reference photo",
+        theme: "unspecified — infer style and any existing ink directly from the reference photo",
+        description: ""
+      };
       if (!analysisState) {
-        setToastMsg({ type: "error", text: "Couldn't analyze your photo automatically — continuing without it." });
+        setToastMsg({
+          type: "error",
+          text: analyzing
+            ? "Still analyzing your photo in the background — generating with general context for now."
+            : "Couldn't analyze your photo automatically — continuing without it."
+        });
       }
 
       // Stage A — generate the isolated design once per round (skip if already

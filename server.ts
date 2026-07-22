@@ -83,20 +83,26 @@ function extractJson(text: string): any {
 // returns a clean, human-readable string — falling back to a friendly
 // message for known transient statuses, and to the caller-provided default
 // for anything else unparseable.
-function friendlyGeminiError(error: any, fallback: string): string {
+function friendlyGeminiError(error: any, fallback: string, modelKind: "image" | "text" = "image"): string {
   const raw = (error?.message || error?.toString?.() || "").toString().trim();
   if (!raw) return fallback;
   if (!raw.startsWith("{")) return raw;
+
+  // "image"/"text" only changes the noun in these two messages — analyze-tattoo
+  // and suggest-tattoo-ideas call this with "text" so a text-model outage
+  // doesn't get misreported as "the image model", which was confusing when it
+  // was the analysis step (not image generation) that actually failed.
+  const modelNoun = modelKind === "text" ? "analysis model" : "image model";
 
   try {
     const parsed = JSON.parse(raw);
     const status = parsed?.error?.status || parsed?.status;
     const inner = parsed?.error?.message || parsed?.message || "";
     if (status === "UNAVAILABLE" || /high demand|overloaded/i.test(inner)) {
-      return "The image model is currently experiencing high demand. Please wait a moment and try again.";
+      return `The ${modelNoun} is currently experiencing high demand. Please wait a moment and try again.`;
     }
     if (status === "RESOURCE_EXHAUSTED" || /quota/i.test(inner)) {
-      return "The image generation quota has been reached. Please try again shortly.";
+      return "The generation quota has been reached. Please try again shortly.";
     }
     if (typeof inner === "string" && inner.trim()) {
       return inner.trim();
@@ -107,6 +113,31 @@ function friendlyGeminiError(error: any, fallback: string): string {
     // coincidentally) — fall back rather than ever showing the raw text.
     return fallback;
   }
+}
+
+/**
+ * Retries a Gemini `generateContent` call a couple of times, but ONLY for
+ * transient server-side overload (HTTP 503 / status "UNAVAILABLE", or a
+ * message mentioning "high demand"/"overloaded") — the same class of error
+ * we've seen intermittently across both the image and text models during
+ * this session, unrelated to our own code. Anything else (bad request,
+ * quota exhausted, auth failure, etc.) fails immediately since retrying
+ * those would just waste time on an error that will never clear itself.
+ */
+async function generateContentWithRetry(ai: GoogleGenAI, params: any, maxAttempts = 3): Promise<any> {
+  let lastError: any;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await ai.models.generateContent(params);
+    } catch (err: any) {
+      lastError = err;
+      const raw = (err?.message || err?.toString?.() || "").toString();
+      const isTransient = /"status"\s*:\s*"UNAVAILABLE"/i.test(raw) || /high demand|overloaded/i.test(raw);
+      if (!isTransient || attempt === maxAttempts) throw err;
+      await new Promise((resolve) => setTimeout(resolve, attempt * 1000)); // 1s, then 2s
+    }
+  }
+  throw lastError;
 }
 
 const CONFIRM_CHOICE_NOTE: Record<string, string> = {
@@ -157,6 +188,16 @@ Style requirements:
 - Highly detailed, clean vector-quality line work suitable for both a photorealistic skin composite and a printable stencil outline.`;
 }
 
+// FOLLOW-UP (not built yet): the Cover-Up-off rule inside this prompt is still
+// text-only — same class of weak grounding the placement box used to have
+// before the burned-in marker fix. The current version (below) softens the
+// old self-conflicting "mandatory visible result" language and adds explicit
+// "flow into the gaps" wording, but a real fix would need an actual
+// ink-location signal (e.g. a cheap gemini-3.5-flash-lite detection pass over
+// the marked region returning rough open-skin-vs-ink sub-areas, then
+// grounding on that the way the corner brackets ground the placement region)
+// rather than relying on the model to infer where the ink is from the photo
+// plus a text instruction alone.
 function buildBlendPrompt(opts: {
   bodyPart: string;
   theme: string;
@@ -205,7 +246,7 @@ Follow these rules strictly:
 - Aspect ratio (crucial): preserve IMAGE 2's own natural proportions exactly — never stretch, squash, or distort it. ${
     extendsOffFrame
       ? "Because this marked region intentionally runs off the edge of the photo, do NOT shrink or re-center the design to force the whole thing to fit inside the visible frame — instead scale it as if the full region (including the off-frame part) were visible, and simply let the portion outside the photo's own edge go uncropped/off-camera, showing only the in-frame slice."
-      : "Scale it up or down uniformly to fit within the marked region. If the region's shape doesn't perfectly match the design's shape, center the correctly-proportioned design within the region and leave any leftover space as plain skin, rather than warping the artwork."
+      : "The marked region's own shape has already been matched to this design's proportions — scale it up or down uniformly so it fills the marked region edge to edge, corner to corner. No centering or letterboxing judgment call is needed here: the brackets already mark exactly where the design belongs, at exactly the right shape."
   }
 - Body accuracy (crucial): reproduce the exact same body shape, outline, proportions, and silhouette against the background as IMAGE 1 — the width, contour, and edge of the ${bodyPart} against its surroundings must match IMAGE 1 pixel-for-pixel in appearance, especially near the edges of the marked region. Do not slim, widen, reshape, or otherwise redraw the limb/body outline; only the ink on its surface changes, never the body's own geometry.
 - Skin-only guard (CRITICAL REQUIREMENT): the new design may ONLY be applied to real, bare human skin. The marked region is a rough guide drawn by a person and may not perfectly align with what's actually skin in the photo — if any part of it falls on clothing, fabric, a strap, a watch or other jewelry, hair, fingernails, or background/surface behind the body (a wall, door, floor, furniture, etc.), do NOT render any tattoo ink onto those non-skin surfaces under any circumstance. Confine the design to whatever actual bare skin is present at/near the marked region instead, shrinking, nudging, or cropping it as needed to keep it entirely on skin — never stretch it across or paint over an object, fabric, or surface that isn't the person's own skin. This includes the eyes: never draw ink on an eyeball, eyelid, or eyelid margin — treat that area as strictly off-limits, full stop, regardless of anything else in this prompt.
@@ -216,7 +257,7 @@ Follow these rules strictly:
       : `Cover-Up Mode is DISABLED. Every pixel of existing tattoo ink visible on IMAGE 1 — anywhere in the frame, including inside the marked region — must remain completely untouched: same linework, same shading, same color, same position. Treat all existing ink as a protected, immutable layer. The new design must be drawn ONLY on bare/open skin within the marked region, routing around any existing ink rather than covering, dimming, blending over, or redrawing any part of it. ${
           extendsOffFrame
             ? "Note: because this marked region deliberately runs off the edge of this photo, only the in-frame slice of the design needs to be placed on open skin here — do not scale up, reposition, or force the entire design to appear within the visible frame just to satisfy this rule; a partial/cropped design confined to the visible, open-skin portion of the region is the correct and expected result for this angle."
-            : "If the marked region does not contain enough open skin for the full design at its original size, do NOT skip or omit the design — instead scale it down and/or reposition it within the marked region so the largest version that fits entirely on open skin is still clearly, visibly applied. A visible new tattoo somewhere in the marked region is mandatory; returning IMAGE 1 essentially unchanged, or with only a barely-visible/cropped fragment of the design, is not an acceptable result even if it feels like the safest way to avoid touching existing ink."
+            : "If the marked region does not contain enough open skin for the full design at its original size and shape, do NOT just shrink it and center it as a smaller rigid rectangle — instead let the design's own individual elements (leaves, clouds, wisps, florals, filigree, whatever it's made of) flow into whatever open skin actually exists around the existing ink, the way a real tattoo artist adds background filler that threads and hugs its way around an established centerpiece rather than sitting on top of it. Redistribute, reshape, crop, or nudge parts of the design so they settle naturally into the real gaps and negative space between existing tattoo pieces, following those contours instead of overlapping them. Aim for the most complete, natural-looking result the available open skin genuinely allows — but a smaller, partial, or even fairly minimal result confined entirely to real open skin is a perfectly good outcome, and is always the correct choice over covering any existing ink to force a more prominent result. Never paint over existing ink just to make the new design bigger or more visible."
         }`
   }
 - Style consistency: blend the design's shading and saturation to match the lighting and skin tone of IMAGE 1 exactly, so the result reads as one cohesive, finished piece by the same artist.
@@ -440,7 +481,7 @@ app.post("/api/analyze-tattoo", async (req, res) => {
       return { inlineData: { mimeType, data } };
     });
 
-    const response = await ai.models.generateContent({
+    const response = await generateContentWithRetry(ai, {
       // gemini-3.5-flash-lite (GA July 2026): ~5x cheaper than 3.5-flash on
       // this single-shot vision-classification + JSON-extraction task, which
       // doesn't need 3.5-flash's heavier reasoning. Verified quality
@@ -473,7 +514,7 @@ app.post("/api/analyze-tattoo", async (req, res) => {
   } catch (error: any) {
     console.error("Tattoo Analysis Error:", error);
     res.status(500).json({
-      error: friendlyGeminiError(error, "Failed to analyze the uploaded photo."),
+      error: friendlyGeminiError(error, "Failed to analyze the uploaded photo.", "text"),
       details: error.toString()
     });
   }
@@ -542,7 +583,7 @@ app.post("/api/generate-tattoo-design", requireAuth, async (req, res) => {
     }
     parts.push({ text: fullPrompt });
 
-    const response = await ai.models.generateContent({
+    const response = await generateContentWithRetry(ai, {
       model: "gemini-3.1-flash-lite-image",
       contents: { parts },
       config: { imageConfig: { aspectRatio: "1:1" } }
@@ -640,7 +681,7 @@ app.post("/api/composite-photorealistic", async (req, res) => {
 
     console.log("Generating photorealistic blend with prompt:", fullPrompt);
 
-    const response = await ai.models.generateContent({
+    const response = await generateContentWithRetry(ai, {
       model: "gemini-3.1-flash-lite-image",
       contents: {
         parts: [
@@ -746,7 +787,7 @@ Respond with ONLY a raw JSON object, no markdown fences, in exactly this shape:
   } catch (error: any) {
     console.error("Tattoo Idea Suggestion Error:", error);
     res.status(500).json({
-      error: friendlyGeminiError(error, "Failed to suggest tattoo ideas."),
+      error: friendlyGeminiError(error, "Failed to suggest tattoo ideas.", "text"),
       details: error.toString()
     });
   }
