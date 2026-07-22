@@ -1,0 +1,71 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile and generation usage records.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "email": { "type": "string" },
+        "displayName": { "type": "string" },
+        "role": { "type": "string" },
+        "tier": { "type": "string" },
+        "createdAt": { "type": "string" },
+        "stripeCustomerId": { "type": "string" },
+        "subscriptionId": { "type": "string" },
+        "subscriptionStatus": { "type": "string" },
+        "generationsThisPeriod": { "type": "number" },
+        "periodStart": { "type": "string" }
+      },
+      "required": ["uid", "role", "tier", "generationsThisPeriod", "periodStart"]
+    },
+    "Project": {
+      "title": "Project",
+      "description": "Saved tattoo studio session/project data.",
+      "type": "object",
+      "properties": {
+        "code": { "type": "string" },
+        "name": { "type": "string" },
+        "basePhotos": { "type": "array" },
+        "activePhotoId": { "type": "string" },
+        "coverUp": { "type": "boolean" },
+        "sliderX": { "type": "number" },
+        "history": { "type": "array" },
+        "design": { "type": "object" },
+        "adjust": { "type": "object" },
+        "isolatedDesignSrc": { "type": "string" },
+        "angleResults": { "type": "object" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["name", "basePhotos", "coverUp", "sliderX"]
+    },
+    "PortfolioItem": {
+      "title": "PortfolioItem",
+      "description": "A shared generated design published to the community portfolio.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "imageUrl": { "type": "string" },
+        "name": { "type": "string" },
+        "likes": { "type": "number" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "imageUrl", "name", "likes", "createdAt"]
+    }
+  },
+  "firestore": {
+    "users/{userId}": {
+      "schema": "User",
+      "description": "Collection of user profiles and metering."
+    },
+    "projects/{projectCode}": {
+      "schema": "Project",
+      "description": "Collection of saved cross-device tattoo design projects."
+    },
+    "portfolio/{portfolioId}": {
+      "schema": "PortfolioItem",
+      "description": "Collection of public portfolio items."
+    }
+  }
+}

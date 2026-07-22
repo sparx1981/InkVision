@@ -1,0 +1,25 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Users can READ their own profile doc, but never write it directly —
+    // role/tier/usage are only ever changed by the server (Admin SDK bypasses
+    // these rules entirely), so a client can't grant itself admin/paid access
+    // by writing to its own doc.
+    match /users/{userId} {
+      allow read: if request.auth != null && request.auth.uid == userId;
+      allow write: if false;
+    }
+
+    // Projects can be loaded/saved via the server or read/written directly
+    match /projects/{projectCode} {
+      allow read, write: if true;
+    }
+
+    // Portfolio items can be browsed by all; likes can be incremented
+    match /portfolio/{portfolioId} {
+      allow read: if true;
+      allow create: if true;
+      allow update: if request.resource.data.diff(resource.data).affectedKeys().hasOnly(['likes']);
+    }
+  }
+}

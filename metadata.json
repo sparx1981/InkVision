@@ -1,0 +1,6 @@
+{
+  "name": "InkVision",
+  "description": "An interactive tattoo visualization suite. Upload body photos, generate custom tattoo designs via Gemini, apply realistic skin texture blending, simulate cover-ups or layered stencils, compare before/after with a slider, and save projects to the cloud.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
