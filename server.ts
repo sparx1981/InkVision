@@ -1,7 +1,6 @@
 import express from "express";
 import path from "path";
 import fs from "fs";
-import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
 import { requireAuth, optionalAuth, requireAdmin } from "./authMiddleware";
@@ -1081,6 +1080,14 @@ app.use((err: any, req: express.Request, res: express.Response, next: express.Ne
 // Integrate Vite Middleware
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {
+    // Loaded dynamically (not a top-level import) so Vercel's serverless
+    // function bundler never has to trace/bundle Vite itself — this whole
+    // branch only ever runs on a real persistent Node host (AI Studio, local
+    // `tsx server.ts`), never on Vercel (see the VERCEL guard below), but a
+    // static `import ... from "vite"` at the top of the file would still get
+    // pulled into the serverless bundle and could crash the function at cold
+    // start even though this code never executes there.
+    const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",
