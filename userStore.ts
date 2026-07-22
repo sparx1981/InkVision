@@ -1,4 +1,4 @@
-import { db } from "./firebaseAdmin";
+import { db } from "./firebaseAdmin.js";
 
 export type PlanTier = "free" | "design_pass" | "artist_starter" | "studio";
 export type AccountRole = "consumer" | "artist" | "studio_admin" | "admin";

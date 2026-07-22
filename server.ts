@@ -3,10 +3,10 @@ import path from "path";
 import fs from "fs";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
-import { requireAuth, optionalAuth, requireAdmin } from "./authMiddleware";
-import { ensureUserDoc, getUserDoc, checkGenerationAllowance, recordGeneration, listAllUsers, adminUpdateUser, adminGrantGenerations, adminResetUsage } from "./userStore";
-import { db as firestoreDb } from "./firebaseAdmin";
-import { stripe, stripeConfigured, createCheckoutSession, createBillingPortalSession, refundLatestPayment, applyStripeEvent } from "./stripeHelpers";
+import { requireAuth, optionalAuth, requireAdmin } from "./authMiddleware.js";
+import { ensureUserDoc, getUserDoc, checkGenerationAllowance, recordGeneration, listAllUsers, adminUpdateUser, adminGrantGenerations, adminResetUsage } from "./userStore.js";
+import { db as firestoreDb } from "./firebaseAdmin.js";
+import { stripe, stripeConfigured, createCheckoutSession, createBillingPortalSession, refundLatestPayment, applyStripeEvent } from "./stripeHelpers.js";
 
 dotenv.config();
 

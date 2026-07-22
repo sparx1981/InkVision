@@ -1,5 +1,5 @@
 import Stripe from "stripe";
-import { db } from "./firebaseAdmin";
+import { db } from "./firebaseAdmin.js";
 
 const secretKey = process.env.STRIPE_SECRET_KEY;
 export const stripeConfigured = !!secretKey && secretKey.trim() !== "";

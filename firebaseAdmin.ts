@@ -3,7 +3,7 @@ import { getFirestore, type Firestore } from "firebase-admin/firestore";
 import { getAuth, type Auth } from "firebase-admin/auth";
 import fs from "fs";
 import path from "path";
-import { HybridFirestore, setForceLocalFallback } from "./dbFallback";
+import { HybridFirestore, setForceLocalFallback } from "./dbFallback.js";
 
 // Load configuration from firebase-applet-config.json if it exists
 let firebaseConfig: any = null;

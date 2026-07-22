@@ -1,5 +1,5 @@
 import { Request, Response, NextFunction } from "express";
-import { authAdmin, adminConfigured } from "./firebaseAdmin";
+import { authAdmin, adminConfigured } from "./firebaseAdmin.js";
 
 // Augment Express's Request type so req.uid/req.userEmail are typed everywhere.
 declare global {
@@ -56,7 +56,7 @@ export async function requireAdmin(req: Request, res: Response, next: NextFuncti
     return res.status(401).json({ error: "Sign in required." });
   }
   try {
-    const { getUserDoc } = await import("./userStore");
+    const { getUserDoc } = await import("./userStore.js");
     const user = await getUserDoc(req.uid);
     if (!user || user.role !== "admin") {
       return res.status(403).json({ error: "Admin access required." });
