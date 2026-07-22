@@ -244,12 +244,26 @@ export async function getImageOrientation(src: string): Promise<{ width: number;
   const height = img.naturalHeight || img.height;
   const ratio = width / height;
 
+  // Matches the full 14-ratio set Gemini 3.1 Flash (Lite) Image supports as of
+  // the July 2026 release (server.ts's /api/composite-photorealistic allowlist
+  // mirrors this same list) — wider than the original 5, so an arbitrary phone
+  // photo's real proportions land closer to one of these before drawImageCover()
+  // has to crop the rest away.
   const candidates: { label: string; value: number }[] = [
     { label: "1:1", value: 1 },
+    { label: "1:4", value: 1 / 4 },
+    { label: "1:8", value: 1 / 8 },
+    { label: "2:3", value: 2 / 3 },
+    { label: "3:2", value: 3 / 2 },
     { label: "3:4", value: 3 / 4 },
+    { label: "4:1", value: 4 / 1 },
     { label: "4:3", value: 4 / 3 },
+    { label: "4:5", value: 4 / 5 },
+    { label: "5:4", value: 5 / 4 },
+    { label: "8:1", value: 8 / 1 },
     { label: "9:16", value: 9 / 16 },
-    { label: "16:9", value: 16 / 9 }
+    { label: "16:9", value: 16 / 9 },
+    { label: "21:9", value: 21 / 9 }
   ];
   let best = candidates[0];
   let bestDiff = Infinity;

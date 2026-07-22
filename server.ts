@@ -441,7 +441,11 @@ app.post("/api/analyze-tattoo", async (req, res) => {
     });
 
     const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
+      // gemini-3.5-flash-lite (GA July 2026): ~5x cheaper than 3.5-flash on
+      // this single-shot vision-classification + JSON-extraction task, which
+      // doesn't need 3.5-flash's heavier reasoning. Verified quality
+      // side-by-side against 3.5-flash before switching (see PR notes).
+      model: "gemini-3.5-flash-lite",
       contents: {
         parts: [{ text: imageParts.length > 1 ? ANALYSIS_INSTRUCTION_MULTI : ANALYSIS_INSTRUCTION_SINGLE }, ...imageParts]
       }
@@ -647,7 +651,17 @@ app.post("/api/composite-photorealistic", async (req, res) => {
       },
       config: {
         imageConfig: {
-          aspectRatio: ["1:1", "3:4", "4:3", "9:16", "16:9"].includes(aspectRatio) ? aspectRatio : "1:1"
+          // Gemini 3.1 Flash (Lite) Image supports 14 output aspect ratios as of
+          // the July 2026 release — wider than the 5 this allowlist used to
+          // cover. Letting getImageOrientation() (imageCompose.ts) pick from the
+          // full set means the requested output ratio lands closer to a real
+          // phone photo's actual proportions, so drawImageCover() has less to
+          // crop away before compositing the patch back onto the original.
+          aspectRatio: [
+            "1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9"
+          ].includes(aspectRatio)
+            ? aspectRatio
+            : "1:1"
         }
       }
     });
@@ -712,7 +726,9 @@ Respond with ONLY a raw JSON object, no markdown fences, in exactly this shape:
 {"ideas": ["...", "...", "...", "..."], "clarifyingQuestion": {"question": "...", "options": ["...", "...", "..."]}}`;
 
     const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
+      // Same swap as /api/analyze-tattoo — plain text JSON generation, no
+      // heavy reasoning required.
+      model: "gemini-3.5-flash-lite",
       contents: { parts: [{ text: instruction }] }
     });
 
