@@ -14,7 +14,7 @@ import {
 } from "./types";
 import { PROMPT_SUGGESTIONS } from "./data/defaultAssets";
 import { generateTattooStencil } from "./utils/stencil";
-import { getImageOrientation, extractMaskedPatch, compositePatchWithAdjust, transformDesignGraphic, burnPlacementMarker, computeContainBox } from "./utils/imageCompose";
+import { getImageOrientation, extractMaskedPatch, compositePatchWithAdjust, transformDesignGraphic, burnPlacementMarker, trimToContent, loadImage } from "./utils/imageCompose";
 import { generateShareQrCode, buildTattooistShareUrl, downloadProjectZip, downloadImagesZip } from "./utils/tattooistShare";
 import TattooStage from "./components/TattooStage";
 import TattooControlPanel from "./components/TattooControlPanel";
@@ -323,6 +323,50 @@ export default function App() {
     (activeTab === "prompt" || !!legacyDesignSrc) &&
     (!placedThisRound[activePhotoId] || repositioningPhotoId === activePhotoId);
 
+  // The placement box is now the design's own layer, not an independent shape
+  // the design merely previews inside of — so whenever a (now-trimmed) design
+  // is freshly selected for an angle that doesn't already have its own box
+  // (a brand new angle, or one mid-Reposition that already restored its prior
+  // box — see handleRepositionAngle), size a fresh box to match that design's
+  // real aspect ratio instead of leaving it at a generic default shape.
+  // PlacementBoxEditor's resize handles then preserve this aspect through any
+  // drag/resize the user does afterward, so the box can never drift out of
+  // sync with the design again the way an independently-shaped box could.
+  useEffect(() => {
+    const currentDesignSrc = activeTab === "prompt" ? isolatedDesignSrc : legacyDesignSrc;
+    if (!currentDesignSrc || !activePhotoId || !activePhoto || !needsPlacement) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const [photoImg, designImg] = await Promise.all([loadImage(activePhoto.src), loadImage(currentDesignSrc)]);
+        if (cancelled) return;
+        const photoW = photoImg.naturalWidth || photoImg.width;
+        const photoH = photoImg.naturalHeight || photoImg.height;
+        const designW = designImg.naturalWidth || designImg.width;
+        const designH = designImg.naturalHeight || designImg.height;
+
+        const widthPct = DEFAULT_BOX_REFERENCE_WIDTH;
+        const widthPx = (widthPct / 100) * photoW;
+        const heightPx = widthPx * (designH / designW);
+        const heightPct = (heightPx / photoH) * 100;
+        const x = Math.max(0, Math.min(50 - widthPct / 2, 100 - widthPct));
+        const y = Math.max(0, Math.min(50 - heightPct / 2, 100 - heightPct));
+
+        setDraftPlacementBoxes((prev) => {
+          if (prev[activePhotoId]) return prev; // already has a box (user-drawn, or restored by Reposition) — don't clobber it
+          return { ...prev, [activePhotoId]: { x, y, width: widthPct, height: heightPct } };
+        });
+      } catch {
+        // Not worth surfacing an error for this — worst case the box just
+        // keeps its generic default shape and the user resizes it by hand.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab === "prompt" ? isolatedDesignSrc : legacyDesignSrc, activePhotoId, needsPlacement]);
+
   // ---------------------------------------------------------------------
   // Resets
   // ---------------------------------------------------------------------
@@ -418,7 +462,12 @@ export default function App() {
   const handleUploadDesignFile = async (file: File) => {
     try {
       const src = await readFileAsDataUrl(file);
-      setUploadedDesignSrc(src);
+      // Trim to the design's actual visible content before it becomes the
+      // placement layer — uploaded files frequently have extra white margin
+      // or a non-tight crop around the artwork (see trimToContent's comment
+      // for why this matters for placement accuracy).
+      const trimmed = await trimToContent(src);
+      setUploadedDesignSrc(trimmed);
       setToastMsg({ type: "success", text: "Reference tattoo design uploaded." });
     } catch {
       setToastMsg({ type: "error", text: "Couldn't read that design file." });
@@ -461,9 +510,19 @@ export default function App() {
     fetchPortfolio();
   };
 
-  const handleSelectPortfolioItem = (item: PortfolioItem) => {
+  const handleSelectPortfolioItem = async (item: PortfolioItem) => {
     setSelectedPortfolioId(item.id);
-    setPortfolioDesignSrc(item.imageUrl);
+    try {
+      // Same content-trim as uploads — Portfolio designs are community
+      // submissions and the tab's own UI already warns these aren't always
+      // cropped tightly to their own artwork.
+      const trimmed = await trimToContent(item.imageUrl);
+      setPortfolioDesignSrc(trimmed);
+    } catch {
+      // If trimming fails for any reason (e.g. a transient load error), fall
+      // back to the original image rather than blocking selection entirely.
+      setPortfolioDesignSrc(item.imageUrl);
+    }
     setToastMsg({ type: "success", text: `Using "${item.name}" from the portfolio.` });
   };
 
@@ -587,20 +646,16 @@ export default function App() {
       saturation: angleAdjust.saturation
     });
 
-    // `box` is the raw rectangle the user dragged/resized — but the on-screen
-    // preview (PlacementBoxEditor) renders the design INSIDE that box with
-    // object-contain, not stretched to fill it, so whenever the design's own
-    // aspect ratio doesn't match the box's (the common case — Stage-A designs
-    // are always a fixed 1:1 square, box shapes are whatever the user drew),
-    // what the user actually saw and approved is a smaller, centered rect
-    // inside the box, not the box itself. Compute that same rect here and use
-    // it everywhere downstream that needs to know where the design REALLY
-    // sits — the burned-in marker, the prompt's region description, and the
-    // feather mask/final crop — so the AI is grounded on the design's actual
-    // placed bounds instead of the outer box (which used to make it fill the
-    // whole box, including the letterboxed margin nothing was placed in).
-    // `box` itself is left untouched for storage/re-editing (see entry below).
-    const containBox = await computeContainBox(baseForBlend, designSrc, box);
+    // `box` IS the design's own placement layer now (not an independent shape
+    // it merely previews inside of) — the design is trimmed to its real
+    // content bounds the moment it's selected, and PlacementBoxEditor's
+    // resize handles keep the box locked to that same aspect ratio through
+    // any drag/resize. So `box` can be used directly everywhere downstream
+    // that needs to know where the design sits: the burned-in marker, the
+    // prompt's region description, and the feather mask/final crop. No
+    // separate contain-fit derivation needed — what the user saw and placed
+    // is exactly what's sent.
+    const containBox = box;
 
     // Burn the marker onto a COPY of the base photo's pixels before it goes to
     // the AI — a visual marker the model can actually see, instead of relying
@@ -735,7 +790,11 @@ export default function App() {
           }
           throw new Error(data.error || "Failed to generate the tattoo design.");
         }
-        designSrc = data.imageUrl;
+        // Trim any margin Gemini left around the isolated design before it
+        // becomes the placement layer — same reasoning as Upload/Portfolio,
+        // Stage A's forced 1:1 square output isn't guaranteed to have the
+        // artwork touch every edge.
+        designSrc = await trimToContent(data.imageUrl);
         setIsolatedDesignSrc(designSrc);
 
         // Usage + portfolio publishing already happened server-side (in the

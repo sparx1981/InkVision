@@ -92,55 +92,92 @@ export async function extractMaskedPatch(baseSrc: string, resultSrc: string, box
 }
 
 /**
- * Computes the actual sub-rectangle a design occupies within a user-drawn
- * placement box, using the same "object-fit: contain" math the on-screen
- * PlacementBoxEditor preview already uses to render `designSrc` inside `box`
- * (`w-full h-full object-contain`) — scaled uniformly to fit entirely inside
- * the box, centered, with any leftover space on one axis left as a letterboxed
- * gap rather than stretched to fill it.
+ * Trims a design image down to its actual visible-artwork bounding box —
+ * scanning out any near-white or fully-transparent margin baked into the
+ * source file — and returns a tightly-cropped PNG.
  *
- * This matters because the box the user drags/resizes and the design's own
- * aspect ratio are frequently different shapes — every Stage-A AI-generated
- * design is a fixed 1:1 square (see /api/generate-tattoo-design), while the
- * box can be any shape the user drew — so "the box" and "where the design is
- * actually visible" are two different rectangles whenever they don't match.
- * Everything downstream that needs to know where the design REALLY sits
- * (the burned-in placement marker, the prompt's region description, the
- * feather mask / final crop) should use this rect, not the raw box, or the
- * AI ends up filling the entire box — including the letterboxed margin the
- * user never actually placed anything in.
+ * This replaces the old computeContainBox() approach. That function tried to
+ * reconcile the user's drawn box with the design's own aspect ratio at
+ * generation time, but it worked off the design file's raw pixel dimensions —
+ * so a design that wasn't cropped tightly to its own artwork (the Portfolio
+ * tab's own UI warns about this: "design cropped tightly to its own edges, no
+ * extra padding") threw off every downstream calculation, since the "shape"
+ * being reasoned about included dead space nothing was ever placed in. Worse,
+ * the on-screen preview rendered that padding with mix-blend-mode:multiply,
+ * which makes white pixels invisible — so the padding wasn't just mismeasured
+ * server-side, it was actually invisible to the person placing the design,
+ * making the resulting scale/position mismatch impossible to spot before
+ * generating.
  *
- * Box coordinates are percentages relative to the base photo, but percentage
- * width/height alone don't capture true on-screen aspect ratio (width% is a
- * fraction of the photo's width, height% a fraction of its height) — so this
- * converts to real pixels using the base photo's actual dimensions before
- * doing the contain-fit math, then converts the result back to percentages
- * in that same coordinate space.
+ * Trimming once, right when a design is selected (see App.tsx), means the
+ * placement box IS the design's real shape from then on — no separate
+ * contain-fit derivation needed. Everything downstream (the burned-in marker,
+ * the prompt's region description, the feather mask/final crop) can just use
+ * the box directly.
  */
-export async function computeContainBox(baseSrc: string, designSrc: string, box: Box): Promise<Box> {
-  const [baseImg, designImg] = await Promise.all([loadImage(baseSrc), loadImage(designSrc)]);
-  const imgW = baseImg.naturalWidth || baseImg.width;
-  const imgH = baseImg.naturalHeight || baseImg.height;
-  const designW = designImg.naturalWidth || designImg.width;
-  const designH = designImg.naturalHeight || designImg.height;
+export async function trimToContent(src: string): Promise<string> {
+  const img = await loadImage(src);
+  const W = img.naturalWidth || img.width;
+  const H = img.naturalHeight || img.height;
 
-  const boxXpx = (box.x / 100) * imgW;
-  const boxYpx = (box.y / 100) * imgH;
-  const boxWpx = (box.width / 100) * imgW;
-  const boxHpx = (box.height / 100) * imgH;
+  const canvas = document.createElement("canvas");
+  canvas.width = W;
+  canvas.height = H;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Could not get 2D canvas context.");
+  ctx.drawImage(img, 0, 0, W, H);
 
-  const scale = Math.min(boxWpx / designW, boxHpx / designH);
-  const containWpx = designW * scale;
-  const containHpx = designH * scale;
-  const containXpx = boxXpx + (boxWpx - containWpx) / 2;
-  const containYpx = boxYpx + (boxHpx - containHpx) / 2;
+  const { data } = ctx.getImageData(0, 0, W, H);
+  let minX = W;
+  let maxX = -1;
+  let minY = H;
+  let maxY = -1;
+  const step = 2; // a sampling grid is plenty for a bounding box and much faster than scanning every pixel
+  for (let y = 0; y < H; y += step) {
+    for (let x = 0; x < W; x += step) {
+      const idx = (y * W + x) * 4;
+      const a = data[idx + 3];
+      if (a < 20) continue; // fully transparent — not content
+      const brightness = (data[idx] + data[idx + 1] + data[idx + 2]) / 3;
+      if (brightness >= 235) continue; // near-white — treated as padding, not content
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+  }
 
-  return {
-    x: (containXpx / imgW) * 100,
-    y: (containYpx / imgH) * 100,
-    width: (containWpx / imgW) * 100,
-    height: (containHpx / imgH) * 100
-  };
+  // Nothing found (blank/all-white/all-transparent file) — return the source
+  // untouched rather than producing a zero-size crop.
+  if (maxX < 0 || maxY < 0) return src;
+
+  // Small margin so fine linework right at the detected edge doesn't get
+  // clipped — the sampling grid above can miss the true edge by up to `step`
+  // pixels.
+  const pad = Math.max(4, Math.round(Math.min(W, H) * 0.01));
+  const cropX = Math.max(0, minX - pad);
+  const cropY = Math.max(0, minY - pad);
+  const cropW = Math.min(W, maxX + pad) - cropX;
+  const cropH = Math.min(H, maxY + pad) - cropY;
+
+  // If the detected content already spans effectively the whole file (within
+  // 2% per edge), skip the crop — this is the common case for designs that
+  // are already tightly cropped, and avoids a pointless re-encode.
+  const marginFrac = 0.02;
+  const alreadyTight =
+    cropX <= W * marginFrac &&
+    cropY <= H * marginFrac &&
+    cropX + cropW >= W * (1 - marginFrac) &&
+    cropY + cropH >= H * (1 - marginFrac);
+  if (alreadyTight) return src;
+
+  const outCanvas = document.createElement("canvas");
+  outCanvas.width = cropW;
+  outCanvas.height = cropH;
+  const outCtx = outCanvas.getContext("2d");
+  if (!outCtx) throw new Error("Could not get 2D canvas context.");
+  outCtx.drawImage(canvas, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
+  return outCanvas.toDataURL("image/png");
 }
 
 /**

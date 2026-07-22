@@ -28,6 +28,8 @@ export default function PlacementBoxEditor({
   const dragMode = useRef<DragMode>(null);
   const dragStart = useRef({ clientX: 0, clientY: 0, box });
   const [naturalAspect, setNaturalAspect] = useState(4 / 3);
+  const [photoPx, setPhotoPx] = useState<{ w: number; h: number } | null>(null);
+  const [designAspectPx, setDesignAspectPx] = useState<number | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -35,6 +37,7 @@ export default function PlacementBoxEditor({
     img.onload = () => {
       if (!cancelled && img.naturalWidth && img.naturalHeight) {
         setNaturalAspect(img.naturalWidth / img.naturalHeight);
+        setPhotoPx({ w: img.naturalWidth, h: img.naturalHeight });
       }
     };
     img.src = imageSrc;
@@ -42,6 +45,28 @@ export default function PlacementBoxEditor({
       cancelled = true;
     };
   }, [imageSrc]);
+
+  // The box IS the design's own placement layer — this tracks the design's
+  // real (already content-trimmed, see trimToContent) pixel aspect ratio so
+  // resizing can preserve it instead of letting the box drift into some other
+  // shape than the design actually is.
+  useEffect(() => {
+    if (!designSrc) {
+      setDesignAspectPx(null);
+      return;
+    }
+    let cancelled = false;
+    const img = new Image();
+    img.onload = () => {
+      if (!cancelled && img.naturalWidth && img.naturalHeight) {
+        setDesignAspectPx(img.naturalWidth / img.naturalHeight);
+      }
+    };
+    img.src = designSrc;
+    return () => {
+      cancelled = true;
+    };
+  }, [designSrc]);
 
   const toPct = (clientX: number, clientY: number) => {
     const el = containerRef.current;
@@ -51,6 +76,51 @@ export default function PlacementBoxEditor({
       dx: ((clientX - dragStart.current.clientX) / rect.width) * 100,
       dy: ((clientY - dragStart.current.clientY) / rect.height) * 100
     };
+  };
+
+  // Aspect-locked, uniform resize around whichever corner is opposite the one
+  // being dragged. Box x/y/width/height are percentages of DIFFERENT axes
+  // (width% of the photo's width, height% of its height), so a single "scale
+  // factor" only preserves the box's true on-screen aspect ratio if it's
+  // computed in real pixels first — not by comparing the percentage numbers
+  // directly.
+  const resizeAspectLocked = (
+    corner: "se" | "sw" | "ne" | "nw",
+    start: PlacementBox,
+    dx: number,
+    dy: number,
+    photoW: number,
+    photoH: number
+  ): PlacementBox => {
+    const startWpx = (start.width / 100) * photoW;
+    const startHpx = (start.height / 100) * photoH;
+    const dxPx = (dx / 100) * photoW;
+    const dyPx = (dy / 100) * photoH;
+
+    const signX = corner === "se" || corner === "ne" ? 1 : -1;
+    const signY = corner === "se" || corner === "sw" ? 1 : -1;
+    const deltaWpx = signX * dxPx;
+    const deltaHpx = signY * dyPx;
+
+    const scaleFromW = (startWpx + deltaWpx) / startWpx;
+    const scaleFromH = (startHpx + deltaHpx) / startHpx;
+    let scale = Math.abs(deltaWpx) >= Math.abs(deltaHpx) ? scaleFromW : scaleFromH;
+    if (!isFinite(scale) || scale <= 0) scale = 1;
+
+    const minScale = Math.max((MIN_SIZE / 100) * photoW / startWpx, (MIN_SIZE / 100) * photoH / startHpx);
+    scale = Math.max(scale, minScale);
+
+    const newWpx = startWpx * scale;
+    const newHpx = startHpx * scale;
+    const width = (newWpx / photoW) * 100;
+    const height = (newHpx / photoH) * 100;
+
+    let x = start.x;
+    let y = start.y;
+    if (corner === "sw" || corner === "nw") x = start.x + start.width - width;
+    if (corner === "ne" || corner === "nw") y = start.y + start.height - height;
+
+    return { x, y, width, height };
   };
 
   const startDrag = (mode: DragMode) => (e: React.PointerEvent) => {
@@ -72,8 +142,14 @@ export default function PlacementBoxEditor({
       if (dragMode.current === "move") {
         next.x = start.x + dx;
         next.y = start.y + dy;
+      } else if (designAspectPx && photoPx) {
+        // A design is selected — resize keeps the box locked to its real
+        // shape so the box can never drift into a different aspect ratio
+        // than the design actually is.
+        next = resizeAspectLocked(dragMode.current, start, dx, dy, photoPx.w, photoPx.h);
       } else {
-        // Resize from whichever corner is being dragged, keeping the opposite corner fixed.
+        // No design yet (or dimensions not loaded) — fall back to free
+        // per-axis resize, keeping the opposite corner fixed.
         const right = start.x + start.width;
         const bottom = start.y + start.height;
         if (dragMode.current === "se") {
@@ -165,12 +241,21 @@ export default function PlacementBoxEditor({
           style={{ background: "transparent" }}
         >
           {designSrc ? (
+            // Deliberately NOT mix-blend-mode:multiply — that hides any white
+            // margin still left around the design (multiply with white is a
+            // no-op), which made this preview look like an honest "what you
+            // place is what you get" layer even when the design wasn't
+            // actually filling the box. Designs are trimmed to their real
+            // content bounds before they ever reach here (see trimToContent
+            // in imageCompose.ts) and the box is aspect-locked to match, so
+            // plain alpha compositing at full box size is now the accurate
+            // picture — object-contain stays only as a defensive fallback for
+            // the brief window before the design's real dimensions load.
             <img
               src={designSrc}
               alt="New tattoo design preview"
               className="w-full h-full object-contain"
               style={{
-                mixBlendMode: "multiply",
                 opacity: (designAdjust?.opacity ?? 100) / 100,
                 filter: `saturate(${designAdjust?.saturation ?? 100}%)`,
                 transform: `rotate(${designAdjust?.rotate ?? 0}deg)`,
