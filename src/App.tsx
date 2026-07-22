@@ -14,7 +14,7 @@ import {
 } from "./types";
 import { PROMPT_SUGGESTIONS } from "./data/defaultAssets";
 import { generateTattooStencil } from "./utils/stencil";
-import { getImageOrientation, extractMaskedPatch, compositePatchWithAdjust, transformDesignGraphic, burnPlacementMarker, trimToContent, loadImage } from "./utils/imageCompose";
+import { getImageOrientation, extractMaskedPatch, compositePatchWithAdjust, transformDesignGraphic, burnPlacementMarker, trimToContent, loadImage, cropToBox, burnSkinMask } from "./utils/imageCompose";
 import { generateShareQrCode, buildTattooistShareUrl, downloadProjectZip, downloadImagesZip } from "./utils/tattooistShare";
 import TattooStage from "./components/TattooStage";
 import TattooControlPanel from "./components/TattooControlPanel";
@@ -657,13 +657,42 @@ export default function App() {
     // is exactly what's sent.
     const containBox = box;
 
-    // Burn the marker onto a COPY of the base photo's pixels before it goes to
-    // the AI — a visual marker the model can actually see, instead of relying
+    // Cover-Up-off only: get a real measured skin-vs-ink signal for the
+    // marked region instead of leaving the blend model to infer it from the
+    // photo through text alone, and burn it in as a visible tint — the same
+    // "pixels beat prose" principle as the corner-bracket placement marker.
+    // Best-effort: if this fails for any reason (transient Gemini issue,
+    // malformed response), fall back silently to the existing text-only
+    // "flow into the gaps" instruction rather than blocking generation on a
+    // non-critical enhancement.
+    let skinMaskApplied = false;
+    let baseForMarking = baseForBlend;
+    if (!coverUp) {
+      try {
+        const croppedRegion = await cropToBox(baseForBlend, containBox);
+        const resSkin = await fetch("/api/detect-skin-regions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ croppedImage: croppedRegion })
+        });
+        const dataSkin = await safeJson(resSkin);
+        if (resSkin.ok && Array.isArray(dataSkin.cells) && dataSkin.rows && dataSkin.cols) {
+          baseForMarking = await burnSkinMask(baseForBlend, containBox, dataSkin.cells, dataSkin.rows, dataSkin.cols);
+          skinMaskApplied = true;
+        }
+      } catch {
+        // Silent fallback — see comment above.
+      }
+    }
+
+    // Burn the placement marker onto a COPY of the base photo's pixels (on
+    // top of the skin mask tint, if one was applied) before it goes to the
+    // AI — a visual marker the model can actually see, instead of relying
     // only on a text description of the region (see burnPlacementMarker's own
     // comment for why). The untouched `baseForBlend` is still what every later
     // step (masked patch extraction, Adjustments, history) is built from —
     // only this one outgoing request uses the marked copy.
-    const markedBaseSrc = await burnPlacementMarker(baseForBlend, containBox);
+    const markedBaseSrc = await burnPlacementMarker(baseForMarking, containBox);
 
     const res2 = await fetch("/api/composite-photorealistic", {
       method: "POST",
@@ -678,6 +707,7 @@ export default function App() {
         confirmChoice,
         correction: correctionText,
         coverUp,
+        skinMaskApplied,
         aspectRatio: orientation.aspectRatio,
         // Only Stage-A generated designs are guaranteed to already be isolated
         // on a clean white background. Uploaded reference images can have any

@@ -188,16 +188,15 @@ Style requirements:
 - Highly detailed, clean vector-quality line work suitable for both a photorealistic skin composite and a printable stencil outline.`;
 }
 
-// FOLLOW-UP (not built yet): the Cover-Up-off rule inside this prompt is still
-// text-only — same class of weak grounding the placement box used to have
-// before the burned-in marker fix. The current version (below) softens the
-// old self-conflicting "mandatory visible result" language and adds explicit
-// "flow into the gaps" wording, but a real fix would need an actual
-// ink-location signal (e.g. a cheap gemini-3.5-flash-lite detection pass over
-// the marked region returning rough open-skin-vs-ink sub-areas, then
-// grounding on that the way the corner brackets ground the placement region)
-// rather than relying on the model to infer where the ink is from the photo
-// plus a text instruction alone.
+// The Cover-Up-off rule inside this prompt is grounded two ways now: the
+// "flow into the gaps" text below (softened from the old self-conflicting
+// "mandatory visible result" language) as a baseline, PLUS — when the skin/ink
+// detection pass succeeds (see /api/detect-skin-regions and burnSkinMask in
+// imageCompose.ts) — an actual burned-in green tint marking measured open-skin
+// sub-areas, the same "pixels beat prose" principle that already grounds the
+// placement region itself via the corner brackets. The detection pass is
+// best-effort: if it fails for any reason, generation still proceeds on the
+// text-only fallback below rather than blocking on a non-critical enhancement.
 function buildBlendPrompt(opts: {
   bodyPart: string;
   theme: string;
@@ -206,9 +205,10 @@ function buildBlendPrompt(opts: {
   correction?: string;
   placementBox: { x: number; y: number; width: number; height: number };
   coverUp: boolean;
+  skinMaskApplied?: boolean;
   designIsPreIsolated?: boolean;
 }): string {
-  const { bodyPart, theme, description, confirmChoice, correction, placementBox, coverUp, designIsPreIsolated = true } = opts;
+  const { bodyPart, theme, description, confirmChoice, correction, placementBox, coverUp, skinMaskApplied = false, designIsPreIsolated = true } = opts;
   const confirmNote = CONFIRM_CHOICE_NOTE[confirmChoice] || CONFIRM_CHOICE_NOTE.A;
   const correctionLine = correction && correction.trim()
     ? `User-provided corrections/additions to factor in: "${correction.trim()}".`
@@ -255,6 +255,10 @@ Follow these rules strictly:
     coverUp
       ? "Cover-Up Mode is ENABLED. The new design must be applied at full visible strength throughout the entire marked region, including directly on top of any existing tattoo ink found there — do not preserve, fade around, tuck behind, or route around the old ink the way you would with Cover-Up disabled. Wherever the new design overlaps existing ink, the new design's linework and shading must dominate and read as the top layer, substantially obscuring the old tattoo's own shapes underneath (a faint ghost of the old ink's darkest lines showing through subtly is acceptable and realistic, but the old design's distinct imagery must no longer be clearly readable through the new one). Leaving the existing tattoo essentially unchanged, still fully recognizable, or only lightly touched at the edges within the marked region is NOT an acceptable result even if it feels like the safest way to avoid disturbing the old ink — visibly transforming the marked region, old ink and all, is mandatory."
       : `Cover-Up Mode is DISABLED. Every pixel of existing tattoo ink visible on IMAGE 1 — anywhere in the frame, including inside the marked region — must remain completely untouched: same linework, same shading, same color, same position. Treat all existing ink as a protected, immutable layer. The new design must be drawn ONLY on bare/open skin within the marked region, routing around any existing ink rather than covering, dimming, blending over, or redrawing any part of it. ${
+          skinMaskApplied
+            ? "IMAGE 1 also has a subtle translucent GREEN tint burned directly onto it, covering exactly the sub-areas of the marked region that were separately measured to be open, bare skin — this tint is a precise, ground-truth guide to where skin actually is, far more reliable than judging it yourself from the photo. The new design may ONLY be placed on the green-tinted areas; treat any area without the tint (whether inside or outside the marked region) as existing ink or otherwise off-limits, and leave it completely untouched. Completely remove/paint over the green tint itself in your output — none of its coloring may remain visible anywhere in the final image, on skin or otherwise. "
+            : ""
+        }${
           extendsOffFrame
             ? "Note: because this marked region deliberately runs off the edge of this photo, only the in-frame slice of the design needs to be placed on open skin here — do not scale up, reposition, or force the entire design to appear within the visible frame just to satisfy this rule; a partial/cropped design confined to the visible, open-skin portion of the region is the correct and expected result for this angle."
             : "If the marked region does not contain enough open skin for the full design at its original size and shape, do NOT just shrink it and center it as a smaller rigid rectangle — instead let the design's own individual elements (leaves, clouds, wisps, florals, filigree, whatever it's made of) flow into whatever open skin actually exists around the existing ink, the way a real tattoo artist adds background filler that threads and hugs its way around an established centerpiece rather than sitting on top of it. Redistribute, reshape, crop, or nudge parts of the design so they settle naturally into the real gaps and negative space between existing tattoo pieces, following those contours instead of overlapping them. Aim for the most complete, natural-looking result the available open skin genuinely allows — but a smaller, partial, or even fairly minimal result confined entirely to real open skin is a perfectly good outcome, and is always the correct choice over covering any existing ink to force a more prominent result. Never paint over existing ink just to make the new design bigger or more visible."
@@ -520,6 +524,77 @@ app.post("/api/analyze-tattoo", async (req, res) => {
   }
 });
 
+// Coarse grid size for the skin/ink detection pass below — fine enough to
+// capture the shape of open skin around existing ink, coarse enough for a
+// cheap Lite model to classify each cell reliably without hallucinating.
+const SKIN_INK_GRID_ROWS = 6;
+const SKIN_INK_GRID_COLS = 6;
+
+// API: classify a cropped placement-region image into a coarse open-skin vs.
+// existing-ink grid (Cover-Up-off only — see the comment above buildBlendPrompt
+// for why this exists). The client crops just the marked region out of the
+// base photo and sends ONLY that crop here — the model classifying exactly
+// what it's given is a much stronger signal than asking it to also locate a
+// described region within a full photo.
+app.post("/api/detect-skin-regions", async (req, res) => {
+  const { croppedImage } = req.body as { croppedImage?: string };
+  if (!croppedImage) {
+    return res.status(400).json({ error: "A cropped region image is required." });
+  }
+
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey || apiKey === "MY_GEMINI_API_KEY" || apiKey.trim() === "") {
+    return res.status(400).json({
+      error: "Gemini API key is not configured. Please add your GEMINI_API_KEY in Settings > Secrets."
+    });
+  }
+
+  try {
+    const ai = new GoogleGenAI({
+      apiKey,
+      httpOptions: { headers: { "User-Agent": "aistudio-build" } }
+    });
+
+    const { mimeType, data } = parseDataUrl(croppedImage);
+    const rows = SKIN_INK_GRID_ROWS;
+    const cols = SKIN_INK_GRID_COLS;
+
+    const prompt = `This image is a close-up crop of a small region of a photograph of a person's skin, which may contain existing tattoo ink. Mentally divide the ENTIRE image into an evenly spaced grid of exactly ${rows} rows by ${cols} columns (row-major order: left to right, then top to bottom, top-left cell first, bottom-right cell last).
+For EACH of the ${rows * cols} cells, classify what's actually shown as exactly one of these three labels:
+- "skin" — bare, open, untattooed skin (if there is no existing tattoo work visible anywhere in the whole image, every cell should be "skin")
+- "ink" — existing tattoo linework/shading covers most of the cell
+- "mixed" — roughly an even mix of both within that one cell
+Respond with ONLY a raw JSON array of exactly ${rows * cols} strings (each one "skin", "ink", or "mixed"), in row-major order — no markdown fences, no commentary, no other text.`;
+
+    const response = await generateContentWithRetry(ai, {
+      // gemini-3.5-flash-lite: same cheap single-shot vision-classification
+      // task as /api/analyze-tattoo above, doesn't need heavier reasoning.
+      model: "gemini-3.5-flash-lite",
+      contents: {
+        parts: [{ inlineData: { mimeType, data } }, { text: prompt }]
+      }
+    });
+
+    const text = response?.candidates?.[0]?.content?.parts?.map((p: any) => p.text || "").join("") || "";
+    if (!text.trim()) {
+      throw new Error("No classification was returned. Please try again.");
+    }
+
+    const cells = extractJson(text);
+    if (!Array.isArray(cells) || cells.length !== rows * cols) {
+      throw new Error("Skin/ink grid response was malformed.");
+    }
+
+    res.json({ success: true, rows, cols, cells });
+  } catch (error: any) {
+    console.error("Skin/Ink Detection Error:", error);
+    res.status(500).json({
+      error: friendlyGeminiError(error, "Failed to analyze open skin vs. existing ink in the marked region.", "text"),
+      details: error.toString()
+    });
+  }
+});
+
 // API: Stage A — generate ONE isolated tattoo design (the single source of truth
 // that gets composited onto every angle, so the artwork itself never varies).
 app.post("/api/generate-tattoo-design", requireAuth, async (req, res) => {
@@ -627,7 +702,8 @@ app.post("/api/composite-photorealistic", async (req, res) => {
     correction = "",
     coverUp = false,
     aspectRatio = "1:1",
-    designIsPreIsolated = true
+    designIsPreIsolated = true,
+    skinMaskApplied = false
   } = req.body as {
     baseImage?: string;
     designImage?: string;
@@ -640,6 +716,7 @@ app.post("/api/composite-photorealistic", async (req, res) => {
     coverUp?: boolean;
     aspectRatio?: string;
     designIsPreIsolated?: boolean;
+    skinMaskApplied?: boolean;
   };
 
   if (!baseImage || !designImage) {
@@ -676,6 +753,7 @@ app.post("/api/composite-photorealistic", async (req, res) => {
       correction,
       placementBox,
       coverUp: !!coverUp,
+      skinMaskApplied: !!skinMaskApplied,
       designIsPreIsolated: designIsPreIsolated !== false
     });
 

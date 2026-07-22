@@ -243,6 +243,77 @@ export async function burnPlacementMarker(baseSrc: string, box: Box): Promise<st
 }
 
 /**
+ * Crops just the placement box out of a photo into its own standalone image,
+ * converting the box's percentage coordinates to real pixels using the source
+ * photo's actual dimensions (same conversion burnPlacementMarker uses).
+ *
+ * Used to hand the skin/ink detection pass (see /api/detect-skin-regions)
+ * EXACTLY the region it needs to classify, instead of the full photo plus a
+ * text description of where the region is — visual grounding for the
+ * detection call itself, the same principle behind everything else here.
+ */
+export async function cropToBox(baseSrc: string, box: Box): Promise<string> {
+  const img = await loadImage(baseSrc);
+  const W = img.naturalWidth || img.width;
+  const H = img.naturalHeight || img.height;
+  const x = (box.x / 100) * W;
+  const y = (box.y / 100) * H;
+  const w = (box.width / 100) * W;
+  const h = (box.height / 100) * H;
+
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(w));
+  canvas.height = Math.max(1, Math.round(h));
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Could not get 2D canvas context.");
+  ctx.drawImage(img, x, y, w, h, 0, 0, canvas.width, canvas.height);
+  return canvas.toDataURL("image/jpeg", 0.9);
+}
+
+/**
+ * Burns a subtle translucent green tint directly onto a copy of the base
+ * photo's pixels, covering only the cells of a row-major `rows` x `cols` grid
+ * over `box` that were classified as "skin" (open, untattooed) by the
+ * detection pass — "ink" and "mixed" cells are left untinted.
+ *
+ * This is the visual-grounding counterpart to burnPlacementMarker's corner
+ * brackets, extended to the Cover-Up-off problem: instead of asking the blend
+ * model to infer skin-vs-ink from the photo through text alone, it gets an
+ * actual measured, burned-in signal for exactly where open skin is. Only
+ * called when Cover-Up is off — with Cover-Up on, painting over existing ink
+ * is the whole point, so there's nothing to protect.
+ */
+export async function burnSkinMask(baseSrc: string, box: Box, cells: string[], rows: number, cols: number): Promise<string> {
+  const baseImg = await loadImage(baseSrc);
+  const width = baseImg.naturalWidth || baseImg.width;
+  const height = baseImg.naturalHeight || baseImg.height;
+
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Could not get 2D canvas context.");
+  ctx.drawImage(baseImg, 0, 0, width, height);
+
+  const boxX = (box.x / 100) * width;
+  const boxY = (box.y / 100) * height;
+  const boxW = (box.width / 100) * width;
+  const boxH = (box.height / 100) * height;
+  const cellW = boxW / cols;
+  const cellH = boxH / rows;
+
+  ctx.fillStyle = "rgba(40, 220, 90, 0.35)";
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      if (cells[r * cols + c] !== "skin") continue;
+      ctx.fillRect(boxX + c * cellW, boxY + r * cellH, cellW, cellH);
+    }
+  }
+
+  return canvas.toDataURL("image/jpeg", 0.92);
+}
+
+/**
  * Composites a masked patch (from `extractMaskedPatch`) onto its base photo,
  * with a live, purely client-side transform — scale/rotate/position/opacity/
  * saturation — pivoted around the placement box's own center so nudging feels
