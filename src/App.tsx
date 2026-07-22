@@ -14,7 +14,7 @@ import {
 } from "./types";
 import { PROMPT_SUGGESTIONS } from "./data/defaultAssets";
 import { generateTattooStencil } from "./utils/stencil";
-import { getImageOrientation, extractMaskedPatch, compositePatchWithAdjust, transformDesignGraphic } from "./utils/imageCompose";
+import { getImageOrientation, extractMaskedPatch, compositePatchWithAdjust, transformDesignGraphic, burnPlacementMarker } from "./utils/imageCompose";
 import { generateShareQrCode, buildTattooistShareUrl, downloadProjectZip, downloadImagesZip } from "./utils/tattooistShare";
 import TattooStage from "./components/TattooStage";
 import TattooControlPanel from "./components/TattooControlPanel";
@@ -557,11 +557,20 @@ export default function App() {
       saturation: angleAdjust.saturation
     });
 
+    // Burn the placement box directly onto a COPY of the base photo's pixels
+    // before it goes to the AI — a visual marker the model can actually see,
+    // instead of relying only on a text description of the region (see
+    // burnPlacementMarker's own comment for why). The untouched `baseForBlend`
+    // is still what every later step (masked patch extraction, Adjustments,
+    // history) is built from — only this one outgoing request uses the
+    // marked copy.
+    const markedBaseSrc = await burnPlacementMarker(baseForBlend, box);
+
     const res2 = await fetch("/api/composite-photorealistic", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        baseImage: baseForBlend,
+        baseImage: markedBaseSrc,
         designImage: transformedDesignSrc,
         placementBox: box,
         bodyPart: analysis.bodyPart,

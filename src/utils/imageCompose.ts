@@ -42,10 +42,37 @@ function buildFeatherMask(width: number, height: number, box: Box): HTMLCanvasEl
 }
 
 /**
+ * Draws `img` into a `width`x`height` canvas region using "cover" scaling —
+ * uniformly scaled so it fills the target box completely, cropping whatever
+ * overflows on one axis, centered. This is the same idea as CSS
+ * `object-fit: cover`, and is deliberately NOT a non-uniform stretch: it never
+ * changes the image's own aspect ratio, so nothing in it gets warped.
+ */
+function drawImageCover(ctx: CanvasRenderingContext2D, img: HTMLImageElement, width: number, height: number) {
+  const iw = img.naturalWidth || img.width;
+  const ih = img.naturalHeight || img.height;
+  const scale = Math.max(width / iw, height / ih);
+  const dw = iw * scale;
+  const dh = ih * scale;
+  const dx = (width - dw) / 2;
+  const dy = (height - dh) / 2;
+  ctx.drawImage(img, dx, dy, dw, dh);
+}
+
+/**
  * Extracts just the AI-generated content into a full-canvas-size PNG that's
  * transparent everywhere outside the (feathered) placement box. This patch can
  * then be nudged/rotated/rescaled independently of the base photo via
  * `compositePatchWithAdjust`, without needing to call the AI again.
+ *
+ * `resultSrc` is Gemini's own output image, which is only ever generated at
+ * one of a handful of fixed aspect ratios (1:1, 3:4, 4:3, 9:16, 16:9) — almost
+ * never an exact match for an arbitrary phone photo's real dimensions. Forcing
+ * it to fill this canvas with a non-uniform stretch (drawImage's simple
+ * width/height form) would distort every proportion in it — the exact wrong
+ * move right before cropping out the patch that has to sit convincingly on
+ * real, undistorted skin. `drawImageCover` scales it uniformly instead, so
+ * whatever gets cropped out keeps its true proportions.
  */
 export async function extractMaskedPatch(baseSrc: string, resultSrc: string, box: Box): Promise<string> {
   const [baseImg, resultImg] = await Promise.all([loadImage(baseSrc), loadImage(resultSrc)]);
@@ -57,11 +84,73 @@ export async function extractMaskedPatch(baseSrc: string, resultSrc: string, box
   resultCanvas.height = height;
   const resultCtx = resultCanvas.getContext("2d");
   if (!resultCtx) throw new Error("Could not get 2D canvas context.");
-  resultCtx.drawImage(resultImg, 0, 0, width, height);
+  drawImageCover(resultCtx, resultImg, width, height);
   resultCtx.globalCompositeOperation = "destination-in";
   resultCtx.drawImage(buildFeatherMask(width, height, box), 0, 0);
 
   return resultCanvas.toDataURL("image/png");
+}
+
+/**
+ * Burns a visible marker for the placement box directly onto the actual pixels
+ * of a copy of the base photo, so the AI can SEE the target region instead of
+ * only reading a text description of it (percentages parsed from prose are a
+ * much weaker spatial signal than pixels the model can look at directly).
+ *
+ * Drawn as small corner brackets rather than a full continuous rectangle —
+ * enough to unambiguously define the region, but not blanketing the target
+ * area itself, which keeps the amount of marker-colored pixels the model has
+ * to fully paint over/remove to a minimum. Uses a color (bright magenta) that
+ * essentially never occurs naturally on skin or in tattoo ink, so it can't be
+ * confused with real content.
+ *
+ * This is ONLY for what gets sent to the AI as a reference image — the
+ * original, unmarked base photo is still what everything else (the final
+ * masked composite, the Adjustments panel, etc.) is built from.
+ */
+export async function burnPlacementMarker(baseSrc: string, box: Box): Promise<string> {
+  const baseImg = await loadImage(baseSrc);
+  const width = baseImg.naturalWidth || baseImg.width;
+  const height = baseImg.naturalHeight || baseImg.height;
+
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Could not get 2D canvas context.");
+  ctx.drawImage(baseImg, 0, 0, width, height);
+
+  const boxX = (box.x / 100) * width;
+  const boxY = (box.y / 100) * height;
+  const boxW = (box.width / 100) * width;
+  const boxH = (box.height / 100) * height;
+
+  const armLen = Math.max(14, Math.min(boxW, boxH) * 0.22);
+  const lineWidth = Math.max(3, Math.min(width, height) * 0.004);
+  const color = "#ff00ea";
+
+  ctx.strokeStyle = color;
+  ctx.lineWidth = lineWidth;
+  ctx.lineCap = "round";
+
+  const corners: Array<[number, number, number, number]> = [
+    [boxX, boxY, 1, 1], // top-left: arms go right and down
+    [boxX + boxW, boxY, -1, 1], // top-right: arms go left and down
+    [boxX, boxY + boxH, 1, -1], // bottom-left: arms go right and up
+    [boxX + boxW, boxY + boxH, -1, -1] // bottom-right: arms go left and up
+  ];
+  for (const [cx, cy, dx, dy] of corners) {
+    ctx.beginPath();
+    ctx.moveTo(cx, cy + dy * armLen);
+    ctx.lineTo(cx, cy);
+    ctx.lineTo(cx + dx * armLen, cy);
+    ctx.stroke();
+  }
+
+  // JPEG, not PNG — this only ever travels to the AI as a reference image,
+  // never gets displayed or stored, so there's no reason to pay PNG's size
+  // cost on a full-resolution photo.
+  return canvas.toDataURL("image/jpeg", 0.92);
 }
 
 /**
