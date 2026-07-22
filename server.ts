@@ -14,6 +14,14 @@ dotenv.config();
 const app = express();
 const PORT = 3000;
 
+// Exported so a Vercel serverless function (api/[...path].ts) can forward
+// requests into this same Express app without needing its own copy of every
+// route. Vercel's Node runtime accepts an Express app directly as a request
+// handler. Locally / on other Node hosts, this export is simply unused —
+// `startServer()` below still runs the app the original way (Vite dev
+// middleware, static `dist` serving, and a real listening port).
+export default app;
+
 // Stripe webhook MUST be registered before express.json() below — Stripe's
 // signature verification needs the raw, unparsed request body, not JSON.
 app.post("/api/stripe-webhook", express.raw({ type: "application/json" }), async (req, res) => {
@@ -1092,4 +1100,12 @@ async function startServer() {
   });
 }
 
-startServer();
+// Vercel deploys this app as a serverless function (see api/[...path].ts) —
+// it invokes the exported `app` directly per-request and never wants a real
+// listening port or Vite's dev/static middleware wired up here. Vercel sets
+// the VERCEL env var automatically on every build and at runtime, so this
+// only skips startServer() there; every other host (AI Studio, `tsx
+// server.ts` locally, a plain Node deploy) behaves exactly as before.
+if (process.env.VERCEL !== "1") {
+  startServer();
+}
