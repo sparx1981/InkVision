@@ -189,15 +189,20 @@ Style requirements:
 }
 
 // Both the Cover-Up-off and Cover-Up-on rules inside this prompt are grounded
-// two ways now: the text rules below as a baseline, PLUS — when the skin/ink/
-// background detection pass succeeds (see /api/detect-skin-regions and
-// burnSkinMask in imageCompose.ts) — an actual burned-in tint marking a
-// measured, ground-truth region: GREEN for confirmed open skin when Cover-Up
-// is off, RED for confirmed non-body background when Cover-Up is on. Same
-// "pixels beat prose" principle that already grounds the placement region
-// itself via the corner brackets. The detection pass is best-effort: if it
-// fails for any reason, generation still proceeds on the text-only fallback
-// below rather than blocking on a non-critical enhancement.
+// two ways now: the text rules below as a baseline, PLUS — when client-side
+// segmentation succeeds (see getSkinSegmentationMask and
+// burnSkinMaskFromSegmentation in imageCompose.ts, which use MediaPipe's
+// on-device Multiclass Selfie Segmentation model, not a Gemini call) — an
+// actual burned-in tint marking a real, pixel-precise region: GREEN for
+// confirmed open skin when Cover-Up is off, RED for confirmed non-body
+// background when Cover-Up is on. Same "pixels beat prose" principle that
+// already grounds the placement region itself via the corner brackets. The
+// same segmentation mask is also used client-side, in extractMaskedPatch, as
+// an actual hard clip on the final composite — so this tint isn't just a
+// hint here, it's a preview of what will be enforced regardless of what the
+// model paints. Segmentation is best-effort: if it fails for any reason,
+// generation still proceeds on the text-only fallback below rather than
+// blocking on a non-critical enhancement.
 function buildBlendPrompt(opts: {
   bodyPart: string;
   theme: string;

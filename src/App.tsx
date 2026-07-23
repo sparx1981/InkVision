@@ -14,7 +14,7 @@ import {
 } from "./types";
 import { PROMPT_SUGGESTIONS } from "./data/defaultAssets";
 import { generateTattooStencil } from "./utils/stencil";
-import { getImageOrientation, extractMaskedPatch, compositePatchWithAdjust, transformDesignGraphic, burnPlacementMarker, trimToContent, loadImage, cropToBox, burnSkinMask } from "./utils/imageCompose";
+import { getImageOrientation, extractMaskedPatch, compositePatchWithAdjust, transformDesignGraphic, burnPlacementMarker, trimToContent, loadImage, cropToBox, getSkinSegmentationMask, burnSkinMaskFromSegmentation } from "./utils/imageCompose";
 import { generateShareQrCode, buildTattooistShareUrl, downloadProjectZip, downloadImagesZip } from "./utils/tattooistShare";
 import TattooStage from "./components/TattooStage";
 import TattooControlPanel from "./components/TattooControlPanel";
@@ -657,34 +657,31 @@ export default function App() {
     // is exactly what's sent.
     const containBox = box;
 
-    // Get a real measured skin/ink/background signal for the marked region
-    // instead of leaving the blend model to infer it from the photo through
-    // text alone, and burn it in as a visible tint — the same "pixels beat
-    // prose" principle as the corner-bracket placement marker. Runs
-    // regardless of Cover-Up mode now: Cover-Up-off gets a GREEN "safe to
-    // place" tint over confirmed open skin (as before), Cover-Up-on gets a
-    // RED "never place here" tint over confirmed non-body background —
-    // previously Cover-Up-on generations had no grounding at all about where
-    // the body actually ends, the likely cause of designs rendering
-    // "floating" over background near the edge of a box drawn close to the
-    // limb's own silhouette. Best-effort: if this fails for any reason
-    // (transient Gemini issue, malformed response), fall back silently to
-    // the existing text-only instructions rather than blocking generation on
-    // a non-critical enhancement.
+    // Get a precise, pixel-level skin-vs-everything-else mask for the whole
+    // base photo via MediaPipe's on-device Multiclass Selfie Segmentation
+    // model (see getSkinSegmentationMask) instead of leaving the blend model
+    // to infer skin/background from the photo through text alone, or relying
+    // on a coarse Gemini-graded grid (the earlier approach). The SAME mask
+    // gets used twice: burned in now as a visible tint (visual grounding —
+    // GREEN over confirmed skin when Cover-Up is off, RED over confirmed
+    // non-skin when Cover-Up is on), and again below as an actual hard clip
+    // in extractMaskedPatch. QA found ink repeatedly bleeding onto walls,
+    // doorways, and clothing whenever a placement box spanned both skin and
+    // non-skin — the earlier grid tint was only ever a hint, and the final
+    // composite was still clipped to a plain rectangle with no body-shape
+    // awareness, so anything the model painted inside that rectangle got
+    // kept regardless of whether it was actually on skin. Using the same
+    // precise mask for both the hint and the enforcement closes that gap.
+    // Best-effort: if segmentation fails to load/run for any reason, fall
+    // back silently to the previous box-only behavior rather than blocking
+    // generation on a non-critical enhancement.
     let regionMaskApplied = false;
     let baseForMarking = baseForBlend;
+    let skinMask: HTMLCanvasElement | undefined;
     try {
-      const croppedRegion = await cropToBox(baseForBlend, containBox);
-      const resSkin = await fetch("/api/detect-skin-regions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ croppedImage: croppedRegion })
-      });
-      const dataSkin = await safeJson(resSkin);
-      if (resSkin.ok && Array.isArray(dataSkin.cells) && dataSkin.rows && dataSkin.cols) {
-        baseForMarking = await burnSkinMask(baseForBlend, containBox, dataSkin.cells, dataSkin.rows, dataSkin.cols, coverUp);
-        regionMaskApplied = true;
-      }
+      skinMask = await getSkinSegmentationMask(baseForBlend);
+      baseForMarking = await burnSkinMaskFromSegmentation(baseForBlend, containBox, skinMask, coverUp);
+      regionMaskApplied = true;
     } catch {
       // Silent fallback — see comment above.
     }
@@ -727,7 +724,7 @@ export default function App() {
       });
       const data2 = await safeJson(res2);
       if (!res2.ok) throw new Error(data2.error || `Failed to generate the composite for ${photo.name}.`);
-      const patchSrc = await extractMaskedPatch(baseForBlend, data2.imageUrl, containBox);
+      const patchSrc = await extractMaskedPatch(baseForBlend, data2.imageUrl, containBox, skinMask);
       return compositePatchWithAdjust(baseForBlend, patchSrc, containBox, DEFAULT_ADJUST);
     };
 

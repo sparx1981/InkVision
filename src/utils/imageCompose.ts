@@ -1,3 +1,5 @@
+import { FilesetResolver, ImageSegmenter } from "@mediapipe/tasks-vision";
+
 export function loadImage(src: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const img = new Image();
@@ -10,6 +12,165 @@ export function loadImage(src: string): Promise<HTMLImageElement> {
 }
 
 type Box = { x: number; y: number; width: number; height: number };
+
+// ---------------------------------------------------------------------
+// Pixel-level body/skin segmentation (MediaPipe Multiclass Selfie
+// Segmentation), replacing the earlier coarse-grid, Gemini-graded approach
+// (see the removed /api/detect-skin-regions call and the old cell-based
+// burnSkinMask). QA on the grid approach found ink repeatedly bleeding onto
+// walls, doorways, and clothing whenever a placement box spanned both skin
+// and non-skin: the grid tint was only ever a hint to the blend model, and
+// the final composite was still hard-clipped to a plain rectangle, so any
+// background pixels the model painted inside that rectangle got kept
+// regardless. This section produces a REAL per-pixel skin mask instead, and
+// that same mask is used twice downstream: once to burn a precise tint the
+// blend model can see (visual grounding, in burnSkinMaskFromSegmentation),
+// and again as an actual hard clip in extractMaskedPatch — so generated ink
+// physically cannot end up outside real skin no matter what the model does.
+// ---------------------------------------------------------------------
+
+// Multiclass Selfie Segmentation category indices (fixed by the model).
+const SEG_CATEGORY_BODY_SKIN = 2;
+const SEG_CATEGORY_FACE_SKIN = 3;
+
+let segmenterPromise: Promise<ImageSegmenter> | null = null;
+
+/** Lazily creates and caches a single ImageSegmenter instance for the whole
+ * session — the WASM runtime + model download only ever happens once. */
+function getSegmenter(): Promise<ImageSegmenter> {
+  if (!segmenterPromise) {
+    segmenterPromise = (async () => {
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.20/wasm"
+      );
+      return ImageSegmenter.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath:
+            "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite",
+          delegate: "GPU"
+        },
+        runningMode: "IMAGE",
+        outputCategoryMask: true,
+        outputConfidenceMasks: false
+      });
+    })();
+  }
+  return segmenterPromise;
+}
+
+/** Draws `src` onto a canvas at `width`x`height` with a light blur — used both
+ * to upscale the segmenter's own output resolution back to the base photo's
+ * real dimensions, and as a small amount of edge anti-aliasing. Kept tight
+ * (a few pixels only) since this mask is later used as a HARD clip: too much
+ * blur would let it bleed past the model's real skin/non-skin boundary. */
+function blurToSize(src: CanvasImageSource, srcW: number, srcH: number, width: number, height: number): HTMLCanvasElement {
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Could not get 2D canvas context.");
+  const blurPx = Math.max(2, Math.round(Math.min(width, height) * 0.003));
+  ctx.filter = `blur(${blurPx}px)`;
+  ctx.drawImage(src, 0, 0, srcW, srcH, 0, 0, width, height);
+  return canvas;
+}
+
+/**
+ * Runs MediaPipe's on-device Multiclass Selfie Segmentation model on the base
+ * photo and returns a full-resolution mask canvas whose ALPHA channel (not
+ * color — this matches buildFeatherMask's own convention so the two can be
+ * combined directly via destination-in) is opaque wherever the model
+ * classified that pixel as the person's own skin (body-skin or face-skin
+ * categories) and fully transparent everywhere else — background, hair,
+ * clothing, jewelry/accessories.
+ *
+ * Runs entirely client-side (WASM + GPU delegate where available), so there's
+ * no added server round-trip and no per-call Gemini cost, unlike the grid
+ * classification this replaces.
+ */
+export async function getSkinSegmentationMask(baseSrc: string): Promise<HTMLCanvasElement> {
+  const img = await loadImage(baseSrc);
+  const width = img.naturalWidth || img.width;
+  const height = img.naturalHeight || img.height;
+
+  const segmenter = await getSegmenter();
+  const result = segmenter.segment(img);
+  const categoryMask = result.categoryMask;
+  if (!categoryMask) {
+    result.close();
+    throw new Error("Segmentation returned no category mask.");
+  }
+
+  const maskData = categoryMask.getAsUint8Array();
+  const mw = categoryMask.width;
+  const mh = categoryMask.height;
+
+  const smallCanvas = document.createElement("canvas");
+  smallCanvas.width = mw;
+  smallCanvas.height = mh;
+  const smallCtx = smallCanvas.getContext("2d");
+  if (!smallCtx) throw new Error("Could not get 2D canvas context.");
+  const imageData = smallCtx.createImageData(mw, mh);
+  for (let i = 0; i < maskData.length; i++) {
+    const category = maskData[i];
+    const isSkin = category === SEG_CATEGORY_BODY_SKIN || category === SEG_CATEGORY_FACE_SKIN;
+    // RGB is irrelevant (destination-in only reads alpha) — always white so
+    // this is trivially inspectable/debuggable if ever drawn directly.
+    imageData.data[i * 4] = 255;
+    imageData.data[i * 4 + 1] = 255;
+    imageData.data[i * 4 + 2] = 255;
+    imageData.data[i * 4 + 3] = isSkin ? 255 : 0;
+  }
+  smallCtx.putImageData(imageData, 0, 0);
+
+  // ImageSegmenterResult.close() frees BOTH the category mask and any
+  // confidence masks in one call — calling categoryMask.close() separately
+  // as well would double-free the same underlying resource.
+  result.close();
+
+  return blurToSize(smallCanvas, mw, mh, width, height);
+}
+
+/** Returns a copy of `maskCanvas` with its alpha channel inverted — used to
+ * turn a "this is skin" mask into a "this is NOT skin" mask (background,
+ * hair, clothing, accessories combined) for Cover-Up mode's red tint. */
+function invertMaskAlpha(maskCanvas: HTMLCanvasElement): HTMLCanvasElement {
+  const w = maskCanvas.width;
+  const h = maskCanvas.height;
+  const ctx = maskCanvas.getContext("2d");
+  if (!ctx) throw new Error("Could not get 2D canvas context.");
+  const imgData = ctx.getImageData(0, 0, w, h);
+
+  const out = document.createElement("canvas");
+  out.width = w;
+  out.height = h;
+  const octx = out.getContext("2d");
+  if (!octx) throw new Error("Could not get 2D canvas context.");
+  const outData = octx.createImageData(w, h);
+  for (let i = 0; i < imgData.data.length; i += 4) {
+    outData.data[i] = 255;
+    outData.data[i + 1] = 255;
+    outData.data[i + 2] = 255;
+    outData.data[i + 3] = 255 - imgData.data[i + 3];
+  }
+  octx.putImageData(outData, 0, 0);
+  return out;
+}
+
+/** Intersects two alpha-encoded masks (see getSkinSegmentationMask /
+ * buildFeatherMask) via destination-in: the result is opaque only where BOTH
+ * inputs were opaque, feathered where either was partial. */
+function combineMasks(base: HTMLCanvasElement, clip: HTMLCanvasElement, width: number, height: number): HTMLCanvasElement {
+  const combined = document.createElement("canvas");
+  combined.width = width;
+  combined.height = height;
+  const cctx = combined.getContext("2d");
+  if (!cctx) throw new Error("Could not get 2D canvas context.");
+  cctx.drawImage(base, 0, 0);
+  cctx.globalCompositeOperation = "destination-in";
+  cctx.drawImage(clip, 0, 0);
+  return combined;
+}
 
 /** Build a soft-edged (blurred) white mask over the box, expanded slightly so the
  * feather doesn't eat into the design itself. Wider/softer than a hard box edge to
@@ -74,7 +235,7 @@ function drawImageCover(ctx: CanvasRenderingContext2D, img: HTMLImageElement, wi
  * real, undistorted skin. `drawImageCover` scales it uniformly instead, so
  * whatever gets cropped out keeps its true proportions.
  */
-export async function extractMaskedPatch(baseSrc: string, resultSrc: string, box: Box): Promise<string> {
+export async function extractMaskedPatch(baseSrc: string, resultSrc: string, box: Box, skinMask?: HTMLCanvasElement): Promise<string> {
   const [baseImg, resultImg] = await Promise.all([loadImage(baseSrc), loadImage(resultSrc)]);
   const width = baseImg.naturalWidth || baseImg.width;
   const height = baseImg.naturalHeight || baseImg.height;
@@ -86,7 +247,18 @@ export async function extractMaskedPatch(baseSrc: string, resultSrc: string, box
   if (!resultCtx) throw new Error("Could not get 2D canvas context.");
   drawImageCover(resultCtx, resultImg, width, height);
   resultCtx.globalCompositeOperation = "destination-in";
-  resultCtx.drawImage(buildFeatherMask(width, height, box), 0, 0);
+
+  // The box feather mask alone only ever guaranteed "outside the drawn
+  // rectangle is untouched" — it says nothing about whether pixels INSIDE
+  // that rectangle are actually skin. When `skinMask` (see
+  // getSkinSegmentationMask) is available, intersect it with the box mask so
+  // the real clip is "inside the box AND confirmed skin" — a hard,
+  // structural guarantee that generated ink can never land on background or
+  // clothing that happened to fall inside the user's drawn box, regardless
+  // of what the AI actually painted there.
+  const boxMask = buildFeatherMask(width, height, box);
+  const finalMask = skinMask ? combineMasks(boxMask, skinMask, width, height) : boxMask;
+  resultCtx.drawImage(finalMask, 0, 0);
 
   return resultCanvas.toDataURL("image/png");
 }
@@ -324,6 +496,56 @@ export async function burnSkinMask(baseSrc: string, box: Box, cells: string[], r
     }
   }
 
+  return canvas.toDataURL("image/jpeg", 0.92);
+}
+
+/**
+ * Pixel-precise replacement for `burnSkinMask` above (kept, but no longer
+ * called — see getSkinSegmentationMask's comment for why). Burns the same
+ * kind of translucent tint, but sourced directly from the real per-pixel
+ * segmentation mask instead of a coarse Gemini-graded grid, and clipped to
+ * that mask's own boundary rather than filling whole grid cells:
+ *
+ * - Cover-Up OFF: GREEN over confirmed skin (body-skin/face-skin) inside the
+ *   placement box — the only area the new design may be placed.
+ * - Cover-Up ON: RED over confirmed NON-skin (background, hair, clothing,
+ *   accessories) inside the placement box — the only area that stays
+ *   off-limits when painting over existing ink is otherwise allowed.
+ *
+ * Using the SAME mask here and in extractMaskedPatch's hard clip means what
+ * the blend model is shown as the safe/unsafe area is exactly what gets
+ * physically enforced afterward — no mismatch between the hint and the
+ * guarantee.
+ */
+export async function burnSkinMaskFromSegmentation(baseSrc: string, box: Box, skinMask: HTMLCanvasElement, coverUp: boolean): Promise<string> {
+  const baseImg = await loadImage(baseSrc);
+  const width = baseImg.naturalWidth || baseImg.width;
+  const height = baseImg.naturalHeight || baseImg.height;
+
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Could not get 2D canvas context.");
+  ctx.drawImage(baseImg, 0, 0, width, height);
+
+  const boxX = (box.x / 100) * width;
+  const boxY = (box.y / 100) * height;
+  const boxW = (box.width / 100) * width;
+  const boxH = (box.height / 100) * height;
+
+  const overlay = document.createElement("canvas");
+  overlay.width = width;
+  overlay.height = height;
+  const octx = overlay.getContext("2d");
+  if (!octx) throw new Error("Could not get 2D canvas context.");
+  octx.fillStyle = coverUp ? "rgba(230, 45, 45, 0.35)" : "rgba(40, 220, 90, 0.35)";
+  octx.fillRect(boxX, boxY, boxW, boxH);
+
+  octx.globalCompositeOperation = "destination-in";
+  octx.drawImage(coverUp ? invertMaskAlpha(skinMask) : skinMask, 0, 0);
+
+  ctx.drawImage(overlay, 0, 0);
   return canvas.toDataURL("image/jpeg", 0.92);
 }
 
