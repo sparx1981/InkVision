@@ -271,19 +271,32 @@ export async function cropToBox(baseSrc: string, box: Box): Promise<string> {
 }
 
 /**
- * Burns a subtle translucent green tint directly onto a copy of the base
- * photo's pixels, covering only the cells of a row-major `rows` x `cols` grid
- * over `box` that were classified as "skin" (open, untattooed) by the
- * detection pass — "ink" and "mixed" cells are left untinted.
+ * Burns a subtle translucent tint directly onto a copy of the base photo's
+ * pixels, covering cells of a row-major `rows` x `cols` grid over `box` that
+ * were classified by the detection pass as either "skin" or "background" (see
+ * /api/detect-skin-regions, which now classifies four labels: skin, ink,
+ * mixed, background) — which cells get tinted, and what the tint means,
+ * depends on Cover-Up mode:
+ *
+ * - Cover-Up OFF: GREEN marks cells classified "skin" — confirmed open,
+ *   untattooed skin, the only safe placement area. "ink", "mixed", and
+ *   "background" cells are all left untinted/off-limits.
+ * - Cover-Up ON: RED marks cells classified "background" — confirmed to NOT
+ *   be part of the person's body at all (wall, furniture, clothing, etc).
+ *   Painting over existing ink is the whole point of Cover-Up mode, so "skin"
+ *   and "ink" cells are both fair game and stay untinted; only true
+ *   background is excluded.
  *
  * This is the visual-grounding counterpart to burnPlacementMarker's corner
- * brackets, extended to the Cover-Up-off problem: instead of asking the blend
- * model to infer skin-vs-ink from the photo through text alone, it gets an
- * actual measured, burned-in signal for exactly where open skin is. Only
- * called when Cover-Up is off — with Cover-Up on, painting over existing ink
- * is the whole point, so there's nothing to protect.
+ * brackets: instead of asking the blend model to infer skin-vs-ink-vs-
+ * background from the photo through text alone, it gets an actual measured,
+ * burned-in signal. Previously this only ran for Cover-Up-off, which left
+ * Cover-Up-on generations with no grounding at all about where the body
+ * actually ends — a likely cause of designs rendering "floating" over
+ * background near the edge of a placement box drawn close to the limb's
+ * silhouette.
  */
-export async function burnSkinMask(baseSrc: string, box: Box, cells: string[], rows: number, cols: number): Promise<string> {
+export async function burnSkinMask(baseSrc: string, box: Box, cells: string[], rows: number, cols: number, coverUp: boolean): Promise<string> {
   const baseImg = await loadImage(baseSrc);
   const width = baseImg.naturalWidth || baseImg.width;
   const height = baseImg.naturalHeight || baseImg.height;
@@ -302,10 +315,11 @@ export async function burnSkinMask(baseSrc: string, box: Box, cells: string[], r
   const cellW = boxW / cols;
   const cellH = boxH / rows;
 
-  ctx.fillStyle = "rgba(40, 220, 90, 0.35)";
+  const targetLabel = coverUp ? "background" : "skin";
+  ctx.fillStyle = coverUp ? "rgba(230, 45, 45, 0.35)" : "rgba(40, 220, 90, 0.35)";
   for (let r = 0; r < rows; r++) {
     for (let c = 0; c < cols; c++) {
-      if (cells[r * cols + c] !== "skin") continue;
+      if (cells[r * cols + c] !== targetLabel) continue;
       ctx.fillRect(boxX + c * cellW, boxY + r * cellH, cellW, cellH);
     }
   }

@@ -657,36 +657,40 @@ export default function App() {
     // is exactly what's sent.
     const containBox = box;
 
-    // Cover-Up-off only: get a real measured skin-vs-ink signal for the
-    // marked region instead of leaving the blend model to infer it from the
-    // photo through text alone, and burn it in as a visible tint — the same
-    // "pixels beat prose" principle as the corner-bracket placement marker.
-    // Best-effort: if this fails for any reason (transient Gemini issue,
-    // malformed response), fall back silently to the existing text-only
-    // "flow into the gaps" instruction rather than blocking generation on a
-    // non-critical enhancement.
-    let skinMaskApplied = false;
+    // Get a real measured skin/ink/background signal for the marked region
+    // instead of leaving the blend model to infer it from the photo through
+    // text alone, and burn it in as a visible tint — the same "pixels beat
+    // prose" principle as the corner-bracket placement marker. Runs
+    // regardless of Cover-Up mode now: Cover-Up-off gets a GREEN "safe to
+    // place" tint over confirmed open skin (as before), Cover-Up-on gets a
+    // RED "never place here" tint over confirmed non-body background —
+    // previously Cover-Up-on generations had no grounding at all about where
+    // the body actually ends, the likely cause of designs rendering
+    // "floating" over background near the edge of a box drawn close to the
+    // limb's own silhouette. Best-effort: if this fails for any reason
+    // (transient Gemini issue, malformed response), fall back silently to
+    // the existing text-only instructions rather than blocking generation on
+    // a non-critical enhancement.
+    let regionMaskApplied = false;
     let baseForMarking = baseForBlend;
-    if (!coverUp) {
-      try {
-        const croppedRegion = await cropToBox(baseForBlend, containBox);
-        const resSkin = await fetch("/api/detect-skin-regions", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ croppedImage: croppedRegion })
-        });
-        const dataSkin = await safeJson(resSkin);
-        if (resSkin.ok && Array.isArray(dataSkin.cells) && dataSkin.rows && dataSkin.cols) {
-          baseForMarking = await burnSkinMask(baseForBlend, containBox, dataSkin.cells, dataSkin.rows, dataSkin.cols);
-          skinMaskApplied = true;
-        }
-      } catch {
-        // Silent fallback — see comment above.
+    try {
+      const croppedRegion = await cropToBox(baseForBlend, containBox);
+      const resSkin = await fetch("/api/detect-skin-regions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ croppedImage: croppedRegion })
+      });
+      const dataSkin = await safeJson(resSkin);
+      if (resSkin.ok && Array.isArray(dataSkin.cells) && dataSkin.rows && dataSkin.cols) {
+        baseForMarking = await burnSkinMask(baseForBlend, containBox, dataSkin.cells, dataSkin.rows, dataSkin.cols, coverUp);
+        regionMaskApplied = true;
       }
+    } catch {
+      // Silent fallback — see comment above.
     }
 
     // Burn the placement marker onto a COPY of the base photo's pixels (on
-    // top of the skin mask tint, if one was applied) before it goes to the
+    // top of the region mask tint, if one was applied) before it goes to the
     // AI — a visual marker the model can actually see, instead of relying
     // only on a text description of the region (see burnPlacementMarker's own
     // comment for why). The untouched `baseForBlend` is still what every later
@@ -694,36 +698,76 @@ export default function App() {
     // only this one outgoing request uses the marked copy.
     const markedBaseSrc = await burnPlacementMarker(baseForMarking, containBox);
 
-    const res2 = await fetch("/api/composite-photorealistic", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        baseImage: markedBaseSrc,
-        designImage: transformedDesignSrc,
-        placementBox: containBox,
-        bodyPart: analysis.bodyPart,
-        theme: analysis.theme,
-        description: analysis.description,
-        confirmChoice,
-        correction: correctionText,
-        coverUp,
-        skinMaskApplied,
-        aspectRatio: orientation.aspectRatio,
-        // Only Stage-A generated designs are guaranteed to already be isolated
-        // on a clean white background. Uploaded reference images can have any
-        // backdrop, so flag those explicitly and let the blend prompt strip
-        // the background out instead of pasting it in as a flat sticker.
-        designIsPreIsolated: activeTab !== "upload"
-      })
-    });
-    const data2 = await safeJson(res2);
-    if (!res2.ok) throw new Error(data2.error || `Failed to generate the composite for ${photo.name}.`);
+    // One full generation attempt: call the blend API, then hard-mask the
+    // result back onto baseForBlend so anything outside containBox is
+    // guaranteed pixel-identical to the original (not just a prompt request,
+    // an actual client-side guarantee — see extractMaskedPatch).
+    const runOneAttempt = async (): Promise<string> => {
+      const res2 = await fetch("/api/composite-photorealistic", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          baseImage: markedBaseSrc,
+          designImage: transformedDesignSrc,
+          placementBox: containBox,
+          bodyPart: analysis.bodyPart,
+          theme: analysis.theme,
+          description: analysis.description,
+          confirmChoice,
+          correction: correctionText,
+          coverUp,
+          skinMaskApplied: regionMaskApplied,
+          aspectRatio: orientation.aspectRatio,
+          // Only Stage-A generated designs are guaranteed to already be isolated
+          // on a clean white background. Uploaded reference images can have any
+          // backdrop, so flag those explicitly and let the blend prompt strip
+          // the background out instead of pasting it in as a flat sticker.
+          designIsPreIsolated: activeTab !== "upload"
+        })
+      });
+      const data2 = await safeJson(res2);
+      if (!res2.ok) throw new Error(data2.error || `Failed to generate the composite for ${photo.name}.`);
+      const patchSrc = await extractMaskedPatch(baseForBlend, data2.imageUrl, containBox);
+      return compositePatchWithAdjust(baseForBlend, patchSrc, containBox, DEFAULT_ADJUST);
+    };
 
-    // Hard guarantee (not just a prompt request): anything outside containBox
-    // is pixel-identical to the original — masked once, final, nothing left
-    // to move afterward (Reposition redraws + regenerates instead).
-    const patchSrc = await extractMaskedPatch(baseForBlend, data2.imageUrl, containBox);
-    const flattenedSrc = await compositePatchWithAdjust(baseForBlend, patchSrc, containBox, DEFAULT_ADJUST);
+    let flattenedSrc = await runOneAttempt();
+
+    // Post-generation sanity check (see /api/verify-tattoo-result). QA found
+    // several distinct failure modes — a design rendering partially off-skin
+    // over the background, a whole design silently missing from the final
+    // result, a design landing somewhere other than the drawn box — that all
+    // share one root cause: nothing ever actually confirmed the AI's output
+    // landed a visible design on real skin inside the marked region before
+    // accepting it. One retry on a "fail" verdict before giving up and
+    // surfacing a warning; best-effort overall — if the verify call itself
+    // errors, just trust the generation as before rather than blocking on a
+    // non-critical check.
+    let warning: string | undefined;
+    try {
+      const verify = async (afterSrc: string): Promise<{ verdict: "pass" | "fail"; reason: string }> => {
+        const [beforeCrop, afterCrop] = await Promise.all([cropToBox(baseForBlend, containBox), cropToBox(afterSrc, containBox)]);
+        const resVerify = await fetch("/api/verify-tattoo-result", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ beforeCrop, afterCrop, coverUp })
+        });
+        const dataVerify = await safeJson(resVerify);
+        if (!resVerify.ok) throw new Error(dataVerify.error || "Verification failed.");
+        return dataVerify;
+      };
+
+      let result = await verify(flattenedSrc);
+      if (result.verdict === "fail") {
+        flattenedSrc = await runOneAttempt();
+        result = await verify(flattenedSrc);
+        if (result.verdict === "fail") {
+          warning = `This generation may not have applied cleanly${result.reason ? ` (${result.reason})` : ""} — try Reposition to regenerate this angle.`;
+        }
+      }
+    } catch {
+      // Best-effort — see comment above. Keep whatever flattenedSrc we already have.
+    }
 
     const entry: AngleResult = {
       // Stored as the raw user-drawn box, not containBox — re-opening this
@@ -731,7 +775,8 @@ export default function App() {
       // not the shrunk contain-fit rect computed from it.
       placementBox: box,
       src: flattenedSrc,
-      baseSrcForThisRound: baseForBlend
+      baseSrcForThisRound: baseForBlend,
+      ...(warning ? { warning } : {})
     };
     return entry;
   };
@@ -870,6 +915,18 @@ export default function App() {
       });
       setRepositioningPhotoId(null);
       setSliderX(45);
+
+      // Surface the post-generation verification warning (see generateOneAngle
+      // / /api/verify-tattoo-result) as a non-blocking heads-up rather than
+      // silently accepting a result that couldn't be confirmed clean — this is
+      // what actually would have caught the "Add Another Tattoo" round
+      // silently dropping the second design in QA, instead of the user only
+      // noticing later.
+      const flaggedAngle = targets.find((p) => updatedResults[p.id]?.warning);
+      if (flaggedAngle) {
+        setToastMsg({ type: "error", text: updatedResults[flaggedAngle.id]!.warning! });
+      }
+
       pushHistoryEntry({
         thumbnailSrc: updatedResults[activePhotoId]?.src || null,
         kind: activeTab,

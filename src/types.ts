@@ -76,6 +76,8 @@ export interface AngleResult {
   src: string;
   /** The accumulated image this round's design was applied on top of — used to redo the blend if the box changes (reposition). */
   baseSrcForThisRound: string;
+  /** Set when the post-generation verification pass (see /api/verify-tattoo-result) still couldn't confirm a clean, fully-on-skin result after a retry — surfaced to the user as a non-blocking heads-up rather than silently accepted. */
+  warning?: string;
 }
 
 /** A snapshot pushed to History each time a generation completes. */

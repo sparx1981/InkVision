@@ -188,15 +188,16 @@ Style requirements:
 - Highly detailed, clean vector-quality line work suitable for both a photorealistic skin composite and a printable stencil outline.`;
 }
 
-// The Cover-Up-off rule inside this prompt is grounded two ways now: the
-// "flow into the gaps" text below (softened from the old self-conflicting
-// "mandatory visible result" language) as a baseline, PLUS — when the skin/ink
-// detection pass succeeds (see /api/detect-skin-regions and burnSkinMask in
-// imageCompose.ts) — an actual burned-in green tint marking measured open-skin
-// sub-areas, the same "pixels beat prose" principle that already grounds the
-// placement region itself via the corner brackets. The detection pass is
-// best-effort: if it fails for any reason, generation still proceeds on the
-// text-only fallback below rather than blocking on a non-critical enhancement.
+// Both the Cover-Up-off and Cover-Up-on rules inside this prompt are grounded
+// two ways now: the text rules below as a baseline, PLUS — when the skin/ink/
+// background detection pass succeeds (see /api/detect-skin-regions and
+// burnSkinMask in imageCompose.ts) — an actual burned-in tint marking a
+// measured, ground-truth region: GREEN for confirmed open skin when Cover-Up
+// is off, RED for confirmed non-body background when Cover-Up is on. Same
+// "pixels beat prose" principle that already grounds the placement region
+// itself via the corner brackets. The detection pass is best-effort: if it
+// fails for any reason, generation still proceeds on the text-only fallback
+// below rather than blocking on a non-critical enhancement.
 function buildBlendPrompt(opts: {
   bodyPart: string;
   theme: string;
@@ -208,7 +209,7 @@ function buildBlendPrompt(opts: {
   skinMaskApplied?: boolean;
   designIsPreIsolated?: boolean;
 }): string {
-  const { bodyPart, theme, description, confirmChoice, correction, placementBox, coverUp, skinMaskApplied = false, designIsPreIsolated = true } = opts;
+  const { bodyPart, theme, description, confirmChoice, correction, placementBox, coverUp, skinMaskApplied: regionMaskApplied = false, designIsPreIsolated = true } = opts;
   const confirmNote = CONFIRM_CHOICE_NOTE[confirmChoice] || CONFIRM_CHOICE_NOTE.A;
   const correctionLine = correction && correction.trim()
     ? `User-provided corrections/additions to factor in: "${correction.trim()}".`
@@ -253,10 +254,14 @@ Follow these rules strictly:
 - Placement and Depth Hierarchy (crucial): the existing tattoo work on IMAGE 1 must always read as in front of / integrated with the new design — never obscured or bled over by it. Where space is tight, tuck the new design spatially behind existing figures rather than on top of them — for example, let a flower or cloud/water background element run behind an existing figure's limb, tail, or armor edge, the way a real tattoo artist works new background pieces in behind an established centerpiece. Any lighter shading in the new design must sit spatially behind or below the darker existing ink.
 - Cover-up (CRITICAL REQUIREMENT): ${
     coverUp
-      ? "Cover-Up Mode is ENABLED. The new design must be applied at full visible strength throughout the entire marked region, including directly on top of any existing tattoo ink found there — do not preserve, fade around, tuck behind, or route around the old ink the way you would with Cover-Up disabled. Wherever the new design overlaps existing ink, the new design's linework and shading must dominate and read as the top layer, substantially obscuring the old tattoo's own shapes underneath (a faint ghost of the old ink's darkest lines showing through subtly is acceptable and realistic, but the old design's distinct imagery must no longer be clearly readable through the new one). Leaving the existing tattoo essentially unchanged, still fully recognizable, or only lightly touched at the edges within the marked region is NOT an acceptable result even if it feels like the safest way to avoid disturbing the old ink — visibly transforming the marked region, old ink and all, is mandatory."
+      ? `Cover-Up Mode is ENABLED. The new design must be applied at full visible strength throughout the entire marked region, including directly on top of any existing tattoo ink found there — do not preserve, fade around, tuck behind, or route around the old ink the way you would with Cover-Up disabled. Wherever the new design overlaps existing ink, the new design's linework and shading must dominate and read as the top layer, substantially obscuring the old tattoo's own shapes underneath (a faint ghost of the old ink's darkest lines showing through subtly is acceptable and realistic, but the old design's distinct imagery must no longer be clearly readable through the new one). Leaving the existing tattoo essentially unchanged, still fully recognizable, or only lightly touched at the edges within the marked region is NOT an acceptable result even if it feels like the safest way to avoid disturbing the old ink — visibly transforming the marked region, old ink and all, is mandatory.${
+          regionMaskApplied
+            ? " IMAGE 1 also has a subtle translucent RED tint burned directly onto it, covering exactly the sub-areas of the marked region that were separately measured to NOT be part of the person's own body at all (background, wall, floor, furniture, clothing, etc) — this tint is a precise, ground-truth guide to where the body actually ends, far more reliable than judging it yourself from the photo. Even though Cover-Up mode allows painting over existing ink everywhere else in the marked region, the red-tinted areas are absolutely off-limits regardless — never place any tattoo ink there under any circumstance, since it is not the person's skin at all. Completely remove/paint over the red tint itself in your output — none of its coloring may remain visible anywhere in the final image."
+            : ""
+        }`
       : `Cover-Up Mode is DISABLED. Every pixel of existing tattoo ink visible on IMAGE 1 — anywhere in the frame, including inside the marked region — must remain completely untouched: same linework, same shading, same color, same position. Treat all existing ink as a protected, immutable layer. The new design must be drawn ONLY on bare/open skin within the marked region, routing around any existing ink rather than covering, dimming, blending over, or redrawing any part of it. ${
-          skinMaskApplied
-            ? "IMAGE 1 also has a subtle translucent GREEN tint burned directly onto it, covering exactly the sub-areas of the marked region that were separately measured to be open, bare skin — this tint is a precise, ground-truth guide to where skin actually is, far more reliable than judging it yourself from the photo. The new design may ONLY be placed on the green-tinted areas; treat any area without the tint (whether inside or outside the marked region) as existing ink or otherwise off-limits, and leave it completely untouched. Completely remove/paint over the green tint itself in your output — none of its coloring may remain visible anywhere in the final image, on skin or otherwise. "
+          regionMaskApplied
+            ? "IMAGE 1 also has a subtle translucent GREEN tint burned directly onto it, covering exactly the sub-areas of the marked region that were separately measured to be open, bare skin — this tint is a precise, ground-truth guide to where skin actually is, far more reliable than judging it yourself from the photo. The new design may ONLY be placed on the green-tinted areas; treat any area without the tint (whether inside or outside the marked region) as existing ink, background, or otherwise off-limits, and leave it completely untouched. Completely remove/paint over the green tint itself in your output — none of its coloring may remain visible anywhere in the final image, on skin or otherwise. "
             : ""
         }${
           extendsOffFrame
@@ -530,12 +535,16 @@ app.post("/api/analyze-tattoo", async (req, res) => {
 const SKIN_INK_GRID_ROWS = 6;
 const SKIN_INK_GRID_COLS = 6;
 
-// API: classify a cropped placement-region image into a coarse open-skin vs.
-// existing-ink grid (Cover-Up-off only — see the comment above buildBlendPrompt
-// for why this exists). The client crops just the marked region out of the
-// base photo and sends ONLY that crop here — the model classifying exactly
-// what it's given is a much stronger signal than asking it to also locate a
-// described region within a full photo.
+// API: classify a cropped placement-region image into a coarse grid of
+// skin / ink / mixed / background (see the comment above buildBlendPrompt for
+// why this exists). Runs for every generation regardless of Cover-Up mode now
+// — the "background" label lets Cover-Up-on generations get the same
+// visual-grounding protection against painting onto a wall/furniture near the
+// edge of the box that Cover-Up-off generations already got for skin-vs-ink.
+// The client crops just the marked region out of the base photo and sends
+// ONLY that crop here — the model classifying exactly what it's given is a
+// much stronger signal than asking it to also locate a described region
+// within a full photo.
 app.post("/api/detect-skin-regions", async (req, res) => {
   const { croppedImage } = req.body as { croppedImage?: string };
   if (!croppedImage) {
@@ -559,12 +568,13 @@ app.post("/api/detect-skin-regions", async (req, res) => {
     const rows = SKIN_INK_GRID_ROWS;
     const cols = SKIN_INK_GRID_COLS;
 
-    const prompt = `This image is a close-up crop of a small region of a photograph of a person's skin, which may contain existing tattoo ink. Mentally divide the ENTIRE image into an evenly spaced grid of exactly ${rows} rows by ${cols} columns (row-major order: left to right, then top to bottom, top-left cell first, bottom-right cell last).
-For EACH of the ${rows * cols} cells, classify what's actually shown as exactly one of these three labels:
-- "skin" — bare, open, untattooed skin (if there is no existing tattoo work visible anywhere in the whole image, every cell should be "skin")
+    const prompt = `This image is a close-up crop of a small region of a photograph of a person's body, which may contain existing tattoo ink and may also include some non-body content near its edges (clothing, jewelry, or whatever is behind/around the body). Mentally divide the ENTIRE image into an evenly spaced grid of exactly ${rows} rows by ${cols} columns (row-major order: left to right, then top to bottom, top-left cell first, bottom-right cell last).
+For EACH of the ${rows * cols} cells, classify what's actually shown as exactly one of these four labels:
+- "skin" — bare, open, untattooed human skin
 - "ink" — existing tattoo linework/shading covers most of the cell
-- "mixed" — roughly an even mix of both within that one cell
-Respond with ONLY a raw JSON array of exactly ${rows * cols} strings (each one "skin", "ink", or "mixed"), in row-major order — no markdown fences, no commentary, no other text.`;
+- "mixed" — roughly an even mix of skin and ink within that one cell
+- "background" — anything that is NOT the person's own bare skin or tattoo ink: clothing, fabric, a strap, jewelry, hair, fingernails, or anything behind/around the body such as a wall, floor, furniture, or other surface
+Respond with ONLY a raw JSON array of exactly ${rows * cols} strings (each one "skin", "ink", "mixed", or "background"), in row-major order — no markdown fences, no commentary, no other text.`;
 
     const response = await generateContentWithRetry(ai, {
       // gemini-3.5-flash-lite: same cheap single-shot vision-classification
@@ -803,6 +813,99 @@ app.post("/api/composite-photorealistic", async (req, res) => {
     console.error("Photorealistic Composite Error:", error);
     res.status(500).json({
       error: friendlyGeminiError(error, "Failed to generate the photorealistic composite."),
+      details: error.toString()
+    });
+  }
+});
+
+// API: post-generation sanity check for the photorealistic composite. Every
+// prior "off-skin floating," "design silently missing," and "placement
+// drifted from the drawn box" failure found in QA shared the same blind spot:
+// the client trusted Gemini's image output was framed/aligned correctly and
+// pasted it straight in, with no check that anything actually landed where
+// (or that it landed at all). This does a cheap, targeted before/after
+// comparison of just the marked region and flags it — the client retries the
+// generation once on a "fail" verdict before giving up and surfacing a
+// warning, rather than silently accepting a bad result. Best-effort by
+// design: if this call itself errors, the client falls back to trusting the
+// generation as before, same non-blocking pattern as the skin/ink detection
+// pass above.
+app.post("/api/verify-tattoo-result", async (req, res) => {
+  const { beforeCrop, afterCrop, coverUp = false } = req.body as {
+    beforeCrop?: string;
+    afterCrop?: string;
+    coverUp?: boolean;
+  };
+  if (!beforeCrop || !afterCrop) {
+    return res.status(400).json({ error: "Both a before and after crop are required." });
+  }
+
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey || apiKey === "MY_GEMINI_API_KEY" || apiKey.trim() === "") {
+    return res.status(400).json({
+      error: "Gemini API key is not configured. Please add your GEMINI_API_KEY in Settings > Secrets."
+    });
+  }
+
+  try {
+    const ai = new GoogleGenAI({
+      apiKey,
+      httpOptions: { headers: { "User-Agent": "aistudio-build" } }
+    });
+
+    const before = parseDataUrl(beforeCrop);
+    const after = parseDataUrl(afterCrop);
+
+    const prompt = `IMAGE 1 shows a close-up of a specific region of a photo BEFORE a new tattoo design was supposed to be added there. IMAGE 2 shows that exact same region AFTER.
+
+Look carefully at both and answer honestly:
+1. Did a clearly new, distinct tattoo design actually appear somewhere within IMAGE 2 compared to IMAGE 1 — not just a lighting shift, color grading change, or subtle noise?
+2. Is that new design fully rendered ON the person's real skin, with no part of it appearing to float, hover, or sit disconnected over background, a wall, furniture, clothing, or empty space outside the body?
+3. ${
+      coverUp
+        ? "Cover-Up mode was ON for this generation, so it's fine and expected if the new design covers or replaces existing tattoo ink that was visible in IMAGE 1."
+        : "Cover-Up mode was OFF for this generation, so any existing tattoo ink visible in IMAGE 1 should still look essentially the same in IMAGE 2 — not painted over, faded, or redrawn."
+    }
+
+Respond with ONLY raw JSON, no markdown fences, no commentary, in exactly this shape:
+{"changed": true|false, "onSkin": true|false, "verdict": "pass"|"fail", "reason": "one short sentence explaining the verdict"}
+
+"verdict" must be "pass" only if a new design clearly appeared AND it is fully on real skin with nothing floating over background. Otherwise it must be "fail".`;
+
+    const response = await generateContentWithRetry(ai, {
+      // gemini-3.5-flash-lite: same cheap single-shot vision-classification task
+      // as the skin/ink detection pass above, doesn't need heavier reasoning.
+      model: "gemini-3.5-flash-lite",
+      contents: {
+        parts: [
+          { inlineData: { mimeType: before.mimeType, data: before.data } },
+          { inlineData: { mimeType: after.mimeType, data: after.data } },
+          { text: prompt }
+        ]
+      }
+    });
+
+    const text = response?.candidates?.[0]?.content?.parts?.map((p: any) => p.text || "").join("") || "";
+    if (!text.trim()) {
+      throw new Error("No verification result was returned.");
+    }
+
+    const parsed = extractJson(text);
+    if (!parsed || typeof parsed.verdict !== "string") {
+      throw new Error("Verification response was malformed.");
+    }
+
+    res.json({
+      success: true,
+      verdict: parsed.verdict === "pass" ? "pass" : "fail",
+      reason: typeof parsed.reason === "string" ? parsed.reason : "",
+      changed: !!parsed.changed,
+      onSkin: !!parsed.onSkin
+    });
+  } catch (error: any) {
+    console.error("Verify Tattoo Result Error:", error);
+    res.status(500).json({
+      error: friendlyGeminiError(error, "Failed to verify the generated result.", "text"),
       details: error.toString()
     });
   }
