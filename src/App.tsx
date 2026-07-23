@@ -713,6 +713,33 @@ export default function App() {
     }
     const useCropFlow = !offFrame && !!cropRegion && !!cropSrc && !!cropSkinMask;
 
+    // --- QA INSTRUMENTATION (temporary — TC-06 vanish diagnosis) ---
+    // Measures what fraction of the placement box the skin mask actually
+    // marked as skin. A near-zero value means extractCropPatch's destination-in
+    // clip will erase the whole design regardless of what Gemini paints.
+    if (useCropFlow && cropSkinMask) {
+      try {
+        const mctx = cropSkinMask.getContext("2d");
+        const mw = cropSkinMask.width;
+        const mh = cropSkinMask.height;
+        const bx = Math.max(0, Math.round((localBox.x / 100) * mw));
+        const by = Math.max(0, Math.round((localBox.y / 100) * mh));
+        const bw = Math.max(1, Math.round((localBox.width / 100) * mw));
+        const bh = Math.max(1, Math.round((localBox.height / 100) * mh));
+        const dat = mctx!.getImageData(bx, by, Math.min(bw, mw - bx), Math.min(bh, mh - by)).data;
+        let skin = 0;
+        const total = dat.length / 4;
+        for (let i = 3; i < dat.length; i += 4) if (dat[i] > 128) skin++;
+        const pct = total ? (skin / total) * 100 : 0;
+        console.log(`[QA] crop skin-mask coverage of placement box: ${pct.toFixed(1)}% (${skin}/${Math.round(total)} px), mask ${mw}x${mh}`);
+        (window as any).__qaCoverage = pct;
+        (window as any).__qaMaskDataUrl = cropSkinMask.toDataURL("image/png");
+        (window as any).__qaCropSrc = cropSrc;
+      } catch (e) {
+        console.log("[QA] coverage measure failed:", e);
+      }
+    }
+
     // Burn the placement marker onto a COPY of whichever image is actually
     // going to the AI (the crop, or the full photo) — on top of the region
     // mask tint, if one was applied — so the model can SEE the target
@@ -754,6 +781,11 @@ export default function App() {
       });
       const data2 = await safeJson(res2);
       if (!res2.ok) throw new Error(data2.error || `Failed to generate the composite for ${photo.name}.`);
+      // --- QA INSTRUMENTATION (temporary — TC-06 vanish diagnosis) ---
+      // Capture Gemini's RAW output (before any client-side clip) so we can
+      // see whether the skull was ever painted, vs. erased by the mask clip.
+      (window as any).__qaGeminiRaw = data2.imageUrl;
+      console.log(`[QA] Gemini raw output captured (${(data2.imageUrl || "").length} chars)`);
       const patchSrc = useCropFlow
         ? await extractCropPatch(baseForBlend, data2.imageUrl, cropRegion!, cropSkinMask!)
         : await extractMaskedPatch(baseForBlend, data2.imageUrl, containBox, skinMask);
