@@ -751,6 +751,29 @@ export default function App() {
     const markedBaseSrc = await burnPlacementMarker(baseForMarking, useCropFlow ? localBox : containBox);
     const cropOrientation = useCropFlow ? await getImageOrientation(cropSrc!) : null;
 
+    // --- QA INSTRUMENTATION (temporary — TC-06 vanish diagnosis, full-photo path) ---
+    console.log(`[QA] flow: offFrame=${offFrame} useCropFlow=${useCropFlow} regionMaskApplied=${regionMaskApplied} skinMaskSet=${!!skinMask} containBox=${JSON.stringify(containBox)}`);
+    if (skinMask) {
+      try {
+        const smctx = skinMask.getContext("2d");
+        const smw = skinMask.width;
+        const smh = skinMask.height;
+        const sbx = Math.max(0, Math.round((containBox.x / 100) * smw));
+        const sby = Math.max(0, Math.round((containBox.y / 100) * smh));
+        const sbw = Math.max(1, Math.round((containBox.width / 100) * smw));
+        const sbh = Math.max(1, Math.round((containBox.height / 100) * smh));
+        const sdat = smctx!.getImageData(sbx, sby, Math.min(sbw, smw - sbx), Math.min(sbh, smh - sby)).data;
+        let sskin = 0;
+        const stotal = sdat.length / 4;
+        for (let i = 3; i < sdat.length; i += 4) if (sdat[i] > 128) sskin++;
+        console.log(`[QA] FULL-PHOTO skin-mask coverage of box: ${stotal ? (sskin / stotal * 100).toFixed(1) : "0"}% (${sskin}/${Math.round(stotal)} px), mask ${smw}x${smh}`);
+        (window as any).__qaFullCoverage = stotal ? (sskin / stotal) * 100 : 0;
+        (window as any).__qaSkinMaskUrl = skinMask.toDataURL("image/png");
+      } catch (e) {
+        console.log("[QA] full-photo coverage measure failed:", e);
+      }
+    }
+
     // One full generation attempt: call the blend API, then hard-mask the
     // result back onto baseForBlend so anything outside the intended region
     // is guaranteed pixel-identical to the original (not just a prompt
