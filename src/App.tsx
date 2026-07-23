@@ -14,7 +14,7 @@ import {
 } from "./types";
 import { PROMPT_SUGGESTIONS } from "./data/defaultAssets";
 import { generateTattooStencil } from "./utils/stencil";
-import { getImageOrientation, extractMaskedPatch, compositePatchWithAdjust, transformDesignGraphic, burnPlacementMarker, trimToContent, loadImage, cropToBox, getSkinSegmentationMask, burnSkinMaskFromSegmentation, isBoxOffFrame, computeCropRegion, boxRelativeTo, extractCropPatch } from "./utils/imageCompose";
+import { getImageOrientation, extractMaskedPatch, compositePatchWithAdjust, transformDesignGraphic, burnPlacementMarker, trimToContent, loadImage, cropToBox, getSkinSegmentationMask, burnSkinMaskFromSegmentation, isBoxOffFrame, computeCropRegion, boxRelativeTo, extractCropPatch, measureDesignBBox } from "./utils/imageCompose";
 import { generateShareQrCode, buildTattooistShareUrl, downloadProjectZip, downloadImagesZip } from "./utils/tattooistShare";
 import TattooStage from "./components/TattooStage";
 import TattooControlPanel from "./components/TattooControlPanel";
@@ -810,7 +810,7 @@ export default function App() {
       (window as any).__qaGeminiRaw = data2.imageUrl;
       console.log(`[QA] Gemini raw output captured (${(data2.imageUrl || "").length} chars)`);
       const patchSrc = useCropFlow
-        ? await extractCropPatch(baseForBlend, data2.imageUrl, cropRegion!, cropSkinMask!)
+        ? await extractCropPatch(baseForBlend, data2.imageUrl, cropRegion!, cropSkinMask!, localBox)
         : await extractMaskedPatch(baseForBlend, data2.imageUrl, containBox, skinMask);
       return compositePatchWithAdjust(baseForBlend, patchSrc, containBox, DEFAULT_ADJUST);
     };
@@ -851,6 +851,34 @@ export default function App() {
       }
     } catch {
       // Best-effort — see comment above. Keep whatever flattenedSrc we already have.
+    }
+
+    // --- Placement grounding (preview vs. final) ---
+    // The user places the design against `containBox` (the box drawn on the
+    // preview). This measures where the design ACTUALLY landed in the final
+    // composite and logs both, so any drift/scale mismatch between what the
+    // user positioned and what was generated is visible and diagnosable
+    // directly — not inferred from screenshots. Best-effort; never blocks.
+    try {
+      const measured = await measureDesignBBox(baseForBlend, flattenedSrc);
+      const r1 = (n: number) => Math.round(n * 10) / 10;
+      const intended = { x: r1(containBox.x), y: r1(containBox.y), w: r1(containBox.width), h: r1(containBox.height) };
+      if (measured) {
+        const iCx = containBox.x + containBox.width / 2;
+        const iCy = containBox.y + containBox.height / 2;
+        const mCx = measured.x + measured.width / 2;
+        const mCy = measured.y + measured.height / 2;
+        console.log(
+          `[QA-PLACE] ${photo.name}: intended=${JSON.stringify(intended)} ` +
+          `measured=${JSON.stringify({ x: r1(measured.x), y: r1(measured.y), w: r1(measured.width), h: r1(measured.height) })} ` +
+          `centerDriftPct=(${r1(mCx - iCx)},${r1(mCy - iCy)}) ` +
+          `scaleRatio=(${r1(measured.width / containBox.width)}x,${r1(measured.height / containBox.height)}y)`
+        );
+      } else {
+        console.log(`[QA-PLACE] ${photo.name}: intended=${JSON.stringify(intended)} measured=NONE (no pixels changed — design vanished)`);
+      }
+    } catch (e) {
+      console.log("[QA-PLACE] measure failed:", e);
     }
 
     const entry: AngleResult = {

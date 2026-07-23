@@ -157,19 +157,68 @@ function invertMaskAlpha(maskCanvas: HTMLCanvasElement): HTMLCanvasElement {
   return out;
 }
 
-/** Intersects two alpha-encoded masks (see getSkinSegmentationMask /
- * buildFeatherMask) via destination-in: the result is opaque only where BOTH
- * inputs were opaque, feathered where either was partial. */
-function combineMasks(base: HTMLCanvasElement, clip: HTMLCanvasElement, width: number, height: number): HTMLCanvasElement {
-  const combined = document.createElement("canvas");
-  combined.width = width;
-  combined.height = height;
-  const cctx = combined.getContext("2d");
-  if (!cctx) throw new Error("Could not get 2D canvas context.");
-  cctx.drawImage(base, 0, 0);
-  cctx.globalCompositeOperation = "destination-in";
-  cctx.drawImage(clip, 0, 0);
-  return combined;
+// The skin mask is only trusted as a clip when it would KEEP at least this
+// fraction of the design Gemini actually painted inside the box. Below it, the
+// segmentation is treated as unreliable for this body part (QA found MediaPipe's
+// selfie model mis-segmenting chests/legs, marking real bare skin as non-skin
+// and thereby erasing valid on-skin ink) and dropped in favour of the
+// box-feather clip alone. See measureSkinRetention.
+const SKIN_CLIP_MIN_RETENTION = 0.5;
+
+/**
+ * Estimates what fraction of the newly-painted design (inside `boxPx`, in the
+ * result canvas's own pixels) the `skinMask` would KEEP if applied as a
+ * destination-in clip. "Painted design" = pixels where the AI result differs
+ * meaningfully from the base at the same spot (i.e. the ink the model actually
+ * added), so this measures erasure of the DESIGN itself — not mere overlap
+ * with the box rectangle, which is what the old coverage % measured and why it
+ * was misleading. `baseCanvas` and `resultCanvas` must be the same size and
+ * spatially aligned; `skinMask` is scaled to that size for sampling.
+ * Returns 1 when nothing was painted (nothing to erase → mask is harmless).
+ */
+function measureSkinRetention(
+  baseCanvas: HTMLCanvasElement,
+  resultCanvas: HTMLCanvasElement,
+  skinMask: HTMLCanvasElement,
+  boxPx: { x: number; y: number; w: number; h: number }
+): number {
+  const w = resultCanvas.width;
+  const h = resultCanvas.height;
+  const bctx = baseCanvas.getContext("2d");
+  const rctx = resultCanvas.getContext("2d");
+  if (!bctx || !rctx) return 1;
+
+  // Sample the skin mask's alpha aligned to the result's pixel grid.
+  const mtmp = document.createElement("canvas");
+  mtmp.width = w;
+  mtmp.height = h;
+  const mctx = mtmp.getContext("2d");
+  if (!mctx) return 1;
+  mctx.drawImage(skinMask, 0, 0, skinMask.width, skinMask.height, 0, 0, w, h);
+
+  const x0 = Math.max(0, Math.floor(boxPx.x));
+  const y0 = Math.max(0, Math.floor(boxPx.y));
+  const x1 = Math.min(w, Math.ceil(boxPx.x + boxPx.w));
+  const y1 = Math.min(h, Math.ceil(boxPx.y + boxPx.h));
+  const bw = x1 - x0;
+  const bh = y1 - y0;
+  if (bw <= 0 || bh <= 0) return 1;
+
+  const bd = bctx.getImageData(x0, y0, bw, bh).data;
+  const rd = rctx.getImageData(x0, y0, bw, bh).data;
+  const md = mctx.getImageData(x0, y0, bw, bh).data;
+
+  let painted = 0;
+  let kept = 0;
+  for (let i = 0; i < bd.length; i += 4) {
+    const diff =
+      Math.abs(bd[i] - rd[i]) + Math.abs(bd[i + 1] - rd[i + 1]) + Math.abs(bd[i + 2] - rd[i + 2]);
+    if (diff > 90) {
+      painted++;
+      if (md[i + 3] > 128) kept++;
+    }
+  }
+  return painted ? kept / painted : 1;
 }
 
 /** Build a soft-edged (blurred) white mask over the box, expanded slightly so the
@@ -246,19 +295,39 @@ export async function extractMaskedPatch(baseSrc: string, resultSrc: string, box
   const resultCtx = resultCanvas.getContext("2d");
   if (!resultCtx) throw new Error("Could not get 2D canvas context.");
   drawImageCover(resultCtx, resultImg, width, height);
-  resultCtx.globalCompositeOperation = "destination-in";
 
-  // The box feather mask alone only ever guaranteed "outside the drawn
-  // rectangle is untouched" — it says nothing about whether pixels INSIDE
-  // that rectangle are actually skin. When `skinMask` (see
-  // getSkinSegmentationMask) is available, intersect it with the box mask so
-  // the real clip is "inside the box AND confirmed skin" — a hard,
-  // structural guarantee that generated ink can never land on background or
-  // clothing that happened to fall inside the user's drawn box, regardless
-  // of what the AI actually painted there.
-  const boxMask = buildFeatherMask(width, height, box);
-  const finalMask = skinMask ? combineMasks(boxMask, skinMask, width, height) : boxMask;
-  resultCtx.drawImage(finalMask, 0, 0);
+  // The box-feather mask is ALWAYS the clip — it structurally guarantees that
+  // nothing outside the user's drawn region ever changes. The MediaPipe skin
+  // mask is now applied ON TOP only conditionally (see measureSkinRetention /
+  // SKIN_CLIP_MIN_RETENTION): it's a best-effort trim of background/clothing
+  // bleed inside the box, but it is dropped whenever it would erase more than
+  // half of the design the model actually painted — because that segmenter is
+  // unreliable on non-arm body parts and was silently deleting valid on-skin
+  // ink. Demoted from a guillotine to a hint with a safety net.
+  let useSkin = false;
+  if (skinMask) {
+    const baseCanvas = document.createElement("canvas");
+    baseCanvas.width = width;
+    baseCanvas.height = height;
+    baseCanvas.getContext("2d")!.drawImage(baseImg, 0, 0, width, height);
+    const boxPx = {
+      x: (box.x / 100) * width,
+      y: (box.y / 100) * height,
+      w: (box.width / 100) * width,
+      h: (box.height / 100) * height
+    };
+    const retention = measureSkinRetention(baseCanvas, resultCanvas, skinMask, boxPx);
+    useSkin = retention >= SKIN_CLIP_MIN_RETENTION;
+    console.log(
+      `[QA-CLIP] full-photo skin retention of painted design: ${(retention * 100).toFixed(1)}% -> ${useSkin ? "APPLY skin clip" : "DROP skin clip (box-feather only)"}`
+    );
+  }
+
+  resultCtx.globalCompositeOperation = "destination-in";
+  resultCtx.drawImage(buildFeatherMask(width, height, box), 0, 0);
+  if (useSkin && skinMask) {
+    resultCtx.drawImage(skinMask, 0, 0, skinMask.width, skinMask.height, 0, 0, width, height);
+  }
 
   return resultCanvas.toDataURL("image/png");
 }
@@ -333,7 +402,7 @@ export function boxRelativeTo(box: Box, cropRegion: Box): Box {
  * extractMaskedPatch, so the result plugs into compositePatchWithAdjust
  * exactly the same way.
  */
-export async function extractCropPatch(baseSrc: string, resultSrc: string, cropRegion: Box, skinMask: HTMLCanvasElement): Promise<string> {
+export async function extractCropPatch(baseSrc: string, resultSrc: string, cropRegion: Box, skinMask: HTMLCanvasElement, localBox: Box): Promise<string> {
   const [baseImg, resultImg] = await Promise.all([loadImage(baseSrc), loadImage(resultSrc)]);
   const baseWidth = baseImg.naturalWidth || baseImg.width;
   const baseHeight = baseImg.naturalHeight || baseImg.height;
@@ -343,14 +412,43 @@ export async function extractCropPatch(baseSrc: string, resultSrc: string, cropR
   const cropW = (cropRegion.width / 100) * baseWidth;
   const cropH = (cropRegion.height / 100) * baseHeight;
 
+  const pw = Math.max(1, Math.round(cropW));
+  const ph = Math.max(1, Math.round(cropH));
+
   const patchCanvas = document.createElement("canvas");
-  patchCanvas.width = Math.max(1, Math.round(cropW));
-  patchCanvas.height = Math.max(1, Math.round(cropH));
+  patchCanvas.width = pw;
+  patchCanvas.height = ph;
   const patchCtx = patchCanvas.getContext("2d");
   if (!patchCtx) throw new Error("Could not get 2D canvas context.");
-  drawImageCover(patchCtx, resultImg, patchCanvas.width, patchCanvas.height);
+  drawImageCover(patchCtx, resultImg, pw, ph);
+
+  // Same crop region of the untouched base, for the design-diff safety check.
+  const baseCropCanvas = document.createElement("canvas");
+  baseCropCanvas.width = pw;
+  baseCropCanvas.height = ph;
+  baseCropCanvas.getContext("2d")!.drawImage(baseImg, cropX, cropY, cropW, cropH, 0, 0, pw, ph);
+
+  // Box-feather is the guaranteed clip; the skin mask is applied on top only
+  // when it wouldn't erase the painted design (see measureSkinRetention). This
+  // replaces the earlier skin-mask-ALONE clip, which had no box edge and could
+  // be wiped entirely by a bad segmentation.
+  const boxPx = {
+    x: (localBox.x / 100) * pw,
+    y: (localBox.y / 100) * ph,
+    w: (localBox.width / 100) * pw,
+    h: (localBox.height / 100) * ph
+  };
+  const retention = measureSkinRetention(baseCropCanvas, patchCanvas, skinMask, boxPx);
+  const useSkin = retention >= SKIN_CLIP_MIN_RETENTION;
+  console.log(
+    `[QA-CLIP] crop skin retention of painted design: ${(retention * 100).toFixed(1)}% -> ${useSkin ? "APPLY skin clip" : "DROP skin clip (box-feather only)"}`
+  );
+
   patchCtx.globalCompositeOperation = "destination-in";
-  patchCtx.drawImage(skinMask, 0, 0, skinMask.width, skinMask.height, 0, 0, patchCanvas.width, patchCanvas.height);
+  patchCtx.drawImage(buildFeatherMask(pw, ph, localBox), 0, 0);
+  if (useSkin) {
+    patchCtx.drawImage(skinMask, 0, 0, skinMask.width, skinMask.height, 0, 0, pw, ph);
+  }
 
   const outCanvas = document.createElement("canvas");
   outCanvas.width = baseWidth;
@@ -539,6 +637,63 @@ export async function cropToBox(baseSrc: string, box: Box): Promise<string> {
   if (!ctx) throw new Error("Could not get 2D canvas context.");
   ctx.drawImage(img, x, y, w, h, 0, 0, canvas.width, canvas.height);
   return canvas.toDataURL("image/jpeg", 0.9);
+}
+
+/**
+ * Measures where the design ACTUALLY landed in the final composite, by diffing
+ * it against the pre-generation base and returning the bounding box of every
+ * pixel that changed, in the same 0-100% coordinate space as the placement box.
+ * Because the composite only ever alters pixels inside the (clipped) placement
+ * patch, the changed-pixel bounds are the design's real footprint — so callers
+ * can log intended-box vs measured-footprint and see any preview→final drift or
+ * scale mismatch directly, rather than inferring it from screenshots. Returns
+ * null when nothing changed (a full vanish), which is itself diagnostic.
+ */
+export async function measureDesignBBox(baseSrc: string, finalSrc: string): Promise<Box | null> {
+  const [baseImg, finalImg] = await Promise.all([loadImage(baseSrc), loadImage(finalSrc)]);
+  const width = baseImg.naturalWidth || baseImg.width;
+  const height = baseImg.naturalHeight || baseImg.height;
+
+  const bc = document.createElement("canvas");
+  bc.width = width;
+  bc.height = height;
+  const bctx = bc.getContext("2d");
+  const fc = document.createElement("canvas");
+  fc.width = width;
+  fc.height = height;
+  const fctx = fc.getContext("2d");
+  if (!bctx || !fctx) return null;
+  bctx.drawImage(baseImg, 0, 0, width, height);
+  fctx.drawImage(finalImg, 0, 0, width, height);
+
+  const bd = bctx.getImageData(0, 0, width, height).data;
+  const fd = fctx.getImageData(0, 0, width, height).data;
+
+  let minX = width;
+  let minY = height;
+  let maxX = -1;
+  let maxY = -1;
+  let changed = 0;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = (y * width + x) * 4;
+      const diff = Math.abs(bd[i] - fd[i]) + Math.abs(bd[i + 1] - fd[i + 1]) + Math.abs(bd[i + 2] - fd[i + 2]);
+      if (diff > 90) {
+        changed++;
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+  if (maxX < 0) return null;
+  return {
+    x: (minX / width) * 100,
+    y: (minY / height) * 100,
+    width: ((maxX - minX + 1) / width) * 100,
+    height: ((maxY - minY + 1) / height) * 100
+  };
 }
 
 /**
