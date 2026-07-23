@@ -263,6 +263,105 @@ export async function extractMaskedPatch(baseSrc: string, resultSrc: string, box
   return resultCanvas.toDataURL("image/png");
 }
 
+// ---------------------------------------------------------------------
+// Crop-region generation (replaces sending the WHOLE base photo to Gemini
+// for the common in-frame case). QA found two failure modes the skin-mask
+// hard clip above doesn't touch: a design landing somewhere on the body
+// entirely different from the drawn box ("drift"), and a design vanishing
+// from the result altogether — both traced to the same root cause, that
+// Gemini is handed the full photo and asked to return a full photo, with no
+// guarantee its output stays framed/aligned the way the input was. A full
+// body photo gives it a lot of room to reframe. Cropping tightly to just a
+// padded region around the placement box before generation shrinks that
+// room dramatically, so there's much less for its output to drift within —
+// and it also fixes a THIRD issue: hard-clipping to the literal drawn box
+// was chopping off parts of a design (e.g. a koi's tail) whenever Gemini's
+// own rendering came out slightly larger than the box, for no good reason —
+// the padding margin here gives that overscale somewhere legitimate to land
+// (still confined to real skin by the mask, just not by an arbitrary
+// rectangle edge). Only used for boxes that are fully in-frame — a box
+// deliberately drawn off the edge of the photo (see extendsOffFrame in
+// server.ts) needs the whole photo for that off-frame cropping behavior to
+// keep working, so that case still uses the original full-photo flow.
+// ---------------------------------------------------------------------
+
+/** True when `box` was deliberately drawn (or dragged) so it runs off the
+ * edge of the photo — see the matching check and comment in server.ts's
+ * buildBlendPrompt, which this must stay consistent with. */
+export function isBoxOffFrame(box: Box): boolean {
+  return box.x < 0 || box.y < 0 || box.x + box.width > 100 || box.y + box.height > 100;
+}
+
+/**
+ * Expands `box` by `marginFrac` of its own width/height on every side and
+ * clamps to the photo's real 0-100% bounds — this padded region, not the
+ * box itself, is what actually gets cropped out and sent to Gemini. Callers
+ * must only use this for boxes where `isBoxOffFrame` is false.
+ */
+export function computeCropRegion(box: Box, marginFrac = 0.5): Box {
+  const padX = box.width * marginFrac;
+  const padY = box.height * marginFrac;
+  const x = Math.max(0, box.x - padX);
+  const y = Math.max(0, box.y - padY);
+  const right = Math.min(100, box.x + box.width + padX);
+  const bottom = Math.min(100, box.y + box.height + padY);
+  return { x, y, width: right - x, height: bottom - y };
+}
+
+/** Re-expresses `box` (in full-photo percentage coordinates) as percentage
+ * coordinates relative to `cropRegion` instead — used once the base photo
+ * has actually been cropped down to just cropRegion, so the corner-bracket
+ * marker, the region tint, and the prompt's own box description all land in
+ * the right place on the smaller cropped image rather than the original. */
+export function boxRelativeTo(box: Box, cropRegion: Box): Box {
+  return {
+    x: ((box.x - cropRegion.x) / cropRegion.width) * 100,
+    y: ((box.y - cropRegion.y) / cropRegion.height) * 100,
+    width: (box.width / cropRegion.width) * 100,
+    height: (box.height / cropRegion.height) * 100
+  };
+}
+
+/**
+ * The crop-region equivalent of `extractMaskedPatch` above: takes Gemini's
+ * output for the CROPPED region (not the whole photo), cover-fits it onto a
+ * canvas matching that crop's own real pixel size, hard-clips it to
+ * `skinMask` alone (see the section comment above for why there's no
+ * rectangular box edge in this clip), and pastes the result onto an
+ * otherwise fully-transparent full-photo-sized canvas at the crop's own
+ * location — same transparent-except-the-relevant-area contract as
+ * extractMaskedPatch, so the result plugs into compositePatchWithAdjust
+ * exactly the same way.
+ */
+export async function extractCropPatch(baseSrc: string, resultSrc: string, cropRegion: Box, skinMask: HTMLCanvasElement): Promise<string> {
+  const [baseImg, resultImg] = await Promise.all([loadImage(baseSrc), loadImage(resultSrc)]);
+  const baseWidth = baseImg.naturalWidth || baseImg.width;
+  const baseHeight = baseImg.naturalHeight || baseImg.height;
+
+  const cropX = (cropRegion.x / 100) * baseWidth;
+  const cropY = (cropRegion.y / 100) * baseHeight;
+  const cropW = (cropRegion.width / 100) * baseWidth;
+  const cropH = (cropRegion.height / 100) * baseHeight;
+
+  const patchCanvas = document.createElement("canvas");
+  patchCanvas.width = Math.max(1, Math.round(cropW));
+  patchCanvas.height = Math.max(1, Math.round(cropH));
+  const patchCtx = patchCanvas.getContext("2d");
+  if (!patchCtx) throw new Error("Could not get 2D canvas context.");
+  drawImageCover(patchCtx, resultImg, patchCanvas.width, patchCanvas.height);
+  patchCtx.globalCompositeOperation = "destination-in";
+  patchCtx.drawImage(skinMask, 0, 0, skinMask.width, skinMask.height, 0, 0, patchCanvas.width, patchCanvas.height);
+
+  const outCanvas = document.createElement("canvas");
+  outCanvas.width = baseWidth;
+  outCanvas.height = baseHeight;
+  const outCtx = outCanvas.getContext("2d");
+  if (!outCtx) throw new Error("Could not get 2D canvas context.");
+  outCtx.drawImage(patchCanvas, cropX, cropY, cropW, cropH);
+
+  return outCanvas.toDataURL("image/png");
+}
+
 /**
  * Trims a design image down to its actual visible-artwork bounding box —
  * scanning out any near-white or fully-transparent margin baked into the

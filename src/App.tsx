@@ -14,7 +14,7 @@ import {
 } from "./types";
 import { PROMPT_SUGGESTIONS } from "./data/defaultAssets";
 import { generateTattooStencil } from "./utils/stencil";
-import { getImageOrientation, extractMaskedPatch, compositePatchWithAdjust, transformDesignGraphic, burnPlacementMarker, trimToContent, loadImage, cropToBox, getSkinSegmentationMask, burnSkinMaskFromSegmentation } from "./utils/imageCompose";
+import { getImageOrientation, extractMaskedPatch, compositePatchWithAdjust, transformDesignGraphic, burnPlacementMarker, trimToContent, loadImage, cropToBox, getSkinSegmentationMask, burnSkinMaskFromSegmentation, isBoxOffFrame, computeCropRegion, boxRelativeTo, extractCropPatch } from "./utils/imageCompose";
 import { generateShareQrCode, buildTattooistShareUrl, downloadProjectZip, downloadImagesZip } from "./utils/tattooistShare";
 import TattooStage from "./components/TattooStage";
 import TattooControlPanel from "./components/TattooControlPanel";
@@ -657,48 +657,78 @@ export default function App() {
     // is exactly what's sent.
     const containBox = box;
 
-    // Get a precise, pixel-level skin-vs-everything-else mask for the whole
-    // base photo via MediaPipe's on-device Multiclass Selfie Segmentation
-    // model (see getSkinSegmentationMask) instead of leaving the blend model
-    // to infer skin/background from the photo through text alone, or relying
-    // on a coarse Gemini-graded grid (the earlier approach). The SAME mask
-    // gets used twice: burned in now as a visible tint (visual grounding —
-    // GREEN over confirmed skin when Cover-Up is off, RED over confirmed
-    // non-skin when Cover-Up is on), and again below as an actual hard clip
-    // in extractMaskedPatch. QA found ink repeatedly bleeding onto walls,
-    // doorways, and clothing whenever a placement box spanned both skin and
-    // non-skin — the earlier grid tint was only ever a hint, and the final
-    // composite was still clipped to a plain rectangle with no body-shape
-    // awareness, so anything the model painted inside that rectangle got
-    // kept regardless of whether it was actually on skin. Using the same
-    // precise mask for both the hint and the enforcement closes that gap.
-    // Best-effort: if segmentation fails to load/run for any reason, fall
-    // back silently to the previous box-only behavior rather than blocking
-    // generation on a non-critical enhancement.
+    // Crop-region generation (see the section comment above computeCropRegion
+    // in imageCompose.ts): for a normal, fully-in-frame box, Gemini is now
+    // handed just a padded region around the box instead of the whole photo
+    // — far less canvas for its output to drift/reframe within, which QA
+    // traced as the root cause behind two separate failures (a design
+    // landing somewhere else on the body entirely, and a design vanishing
+    // from the result altogether). A box deliberately drawn off the edge of
+    // the photo (see isBoxOffFrame) still needs the whole photo for that
+    // intentional partial-crop behavior to keep working, so that case falls
+    // back to the original full-photo flow untouched.
+    //
+    // Either way, a precise, pixel-level skin-vs-everything-else mask (see
+    // getSkinSegmentationMask, MediaPipe's on-device segmentation — no
+    // server round-trip) gets burned in as a visible tint (visual grounding
+    // — GREEN over confirmed skin when Cover-Up is off, RED over confirmed
+    // non-skin when Cover-Up is on) and used again below as the actual hard
+    // clip. In the crop-region case that clip is the skin mask ALONE, with
+    // no rectangular box edge on top of it — QA also found the old box-edge
+    // clip chopping off parts of a design (e.g. a koi's tail) whenever
+    // Gemini's own rendering came out slightly larger than the drawn box;
+    // the padding margin around the crop gives that overscale somewhere
+    // legitimate to land, still confined to real skin, just not to an
+    // arbitrary rectangle. Best-effort throughout: if segmentation fails to
+    // load/run for any reason, fall back silently to the plain box-only
+    // clip rather than blocking generation on a non-critical enhancement.
+    const offFrame = isBoxOffFrame(containBox);
     let regionMaskApplied = false;
     let baseForMarking = baseForBlend;
-    let skinMask: HTMLCanvasElement | undefined;
+    let skinMask: HTMLCanvasElement | undefined; // full-photo-space mask — off-frame path only
+    let cropRegion: PlacementBox | undefined;
+    let cropSkinMask: HTMLCanvasElement | undefined; // crop-space mask — normal path only
+    let cropSrc: string | undefined;
+    let localBox: PlacementBox = containBox;
     try {
-      skinMask = await getSkinSegmentationMask(baseForBlend);
-      baseForMarking = await burnSkinMaskFromSegmentation(baseForBlend, containBox, skinMask, coverUp);
+      if (offFrame) {
+        skinMask = await getSkinSegmentationMask(baseForBlend);
+        baseForMarking = await burnSkinMaskFromSegmentation(baseForBlend, containBox, skinMask, coverUp);
+      } else {
+        cropRegion = computeCropRegion(containBox);
+        cropSrc = await cropToBox(baseForBlend, cropRegion);
+        cropSkinMask = await getSkinSegmentationMask(cropSrc);
+        localBox = boxRelativeTo(containBox, cropRegion);
+        baseForMarking = await burnSkinMaskFromSegmentation(cropSrc, localBox, cropSkinMask, coverUp);
+      }
       regionMaskApplied = true;
     } catch {
-      // Silent fallback — see comment above.
+      // Silent fallback — see comment above. cropRegion/cropSrc may be
+      // partially set; runOneAttempt below only trusts them alongside
+      // cropSkinMask, so a failure here cleanly falls back to the
+      // full-photo box-only flow.
+      cropRegion = undefined;
+      cropSkinMask = undefined;
+      localBox = containBox;
     }
+    const useCropFlow = !offFrame && !!cropRegion && !!cropSrc && !!cropSkinMask;
 
-    // Burn the placement marker onto a COPY of the base photo's pixels (on
-    // top of the region mask tint, if one was applied) before it goes to the
-    // AI — a visual marker the model can actually see, instead of relying
-    // only on a text description of the region (see burnPlacementMarker's own
-    // comment for why). The untouched `baseForBlend` is still what every later
-    // step (masked patch extraction, Adjustments, history) is built from —
-    // only this one outgoing request uses the marked copy.
-    const markedBaseSrc = await burnPlacementMarker(baseForMarking, containBox);
+    // Burn the placement marker onto a COPY of whichever image is actually
+    // going to the AI (the crop, or the full photo) — on top of the region
+    // mask tint, if one was applied — so the model can SEE the target
+    // region instead of only reading a text description of it (see
+    // burnPlacementMarker's own comment for why). The untouched
+    // `baseForBlend` is still what every later step (patch extraction,
+    // Adjustments, history) is built from — only this one outgoing request
+    // uses the marked copy.
+    const markedBaseSrc = await burnPlacementMarker(baseForMarking, useCropFlow ? localBox : containBox);
+    const cropOrientation = useCropFlow ? await getImageOrientation(cropSrc!) : null;
 
     // One full generation attempt: call the blend API, then hard-mask the
-    // result back onto baseForBlend so anything outside containBox is
-    // guaranteed pixel-identical to the original (not just a prompt request,
-    // an actual client-side guarantee — see extractMaskedPatch).
+    // result back onto baseForBlend so anything outside the intended region
+    // is guaranteed pixel-identical to the original (not just a prompt
+    // request, an actual client-side guarantee — see extractCropPatch /
+    // extractMaskedPatch).
     const runOneAttempt = async (): Promise<string> => {
       const res2 = await fetch("/api/composite-photorealistic", {
         method: "POST",
@@ -706,7 +736,7 @@ export default function App() {
         body: JSON.stringify({
           baseImage: markedBaseSrc,
           designImage: transformedDesignSrc,
-          placementBox: containBox,
+          placementBox: useCropFlow ? localBox : containBox,
           bodyPart: analysis.bodyPart,
           theme: analysis.theme,
           description: analysis.description,
@@ -714,7 +744,7 @@ export default function App() {
           correction: correctionText,
           coverUp,
           skinMaskApplied: regionMaskApplied,
-          aspectRatio: orientation.aspectRatio,
+          aspectRatio: useCropFlow ? cropOrientation!.aspectRatio : orientation.aspectRatio,
           // Only Stage-A generated designs are guaranteed to already be isolated
           // on a clean white background. Uploaded reference images can have any
           // backdrop, so flag those explicitly and let the blend prompt strip
@@ -724,7 +754,9 @@ export default function App() {
       });
       const data2 = await safeJson(res2);
       if (!res2.ok) throw new Error(data2.error || `Failed to generate the composite for ${photo.name}.`);
-      const patchSrc = await extractMaskedPatch(baseForBlend, data2.imageUrl, containBox, skinMask);
+      const patchSrc = useCropFlow
+        ? await extractCropPatch(baseForBlend, data2.imageUrl, cropRegion!, cropSkinMask!)
+        : await extractMaskedPatch(baseForBlend, data2.imageUrl, containBox, skinMask);
       return compositePatchWithAdjust(baseForBlend, patchSrc, containBox, DEFAULT_ADJUST);
     };
 
