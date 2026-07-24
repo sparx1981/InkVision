@@ -366,10 +366,22 @@ export function isBoxOffFrame(box: Box): boolean {
  * clamps to the photo's real 0-100% bounds — this padded region, not the
  * box itself, is what actually gets cropped out and sent to Gemini. Callers
  * must only use this for boxes where `isBoxOffFrame` is false.
+ *
+ * The per-side padding is ALSO capped at `maxMarginPct` percentage-points of
+ * the photo. Without the cap, a large placement box got a proportionally huge
+ * margin (50% of a 42%-wide box = 21pt per side), and for a chest box next to
+ * an existing sleeve that margin swallowed the whole arm into the crop —
+ * whereupon Gemini anchored the new design onto the existing arm ink instead
+ * of the bare chest the box marked (QA measured this as a ~7pt placement
+ * drift, design landing on the arm). Capping the margin keeps the crop tight
+ * around the drawn region so Gemini's attention stays there, while still
+ * leaving enough room for the small-design overscale case the margin exists
+ * for. Small boxes are unaffected (their proportional margin is already below
+ * the cap).
  */
-export function computeCropRegion(box: Box, marginFrac = 0.5): Box {
-  const padX = box.width * marginFrac;
-  const padY = box.height * marginFrac;
+export function computeCropRegion(box: Box, marginFrac = 0.5, maxMarginPct = 12): Box {
+  const padX = Math.min(box.width * marginFrac, maxMarginPct);
+  const padY = Math.min(box.height * marginFrac, maxMarginPct);
   const x = Math.max(0, box.x - padX);
   const y = Math.max(0, box.y - padY);
   const right = Math.min(100, box.x + box.width + padX);
