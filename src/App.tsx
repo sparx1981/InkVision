@@ -29,7 +29,16 @@ import LoadProjectModal from "./LoadProjectModal";
 import { signOutUser, getIdToken, db } from "./firebase";
 import { collection, doc, getDoc, getDocs, setDoc, updateDoc, increment } from "firebase/firestore";
 
-const MAX_ANGLES = 4;
+// Multi-angle base photos are temporarily disabled (see below). The feature let
+// users upload the same body part from several angles, but each angle was placed
+// and generated INDEPENDENTLY — there's no shared 3D model, so a design placed on
+// the front rendered as a whole separate design on the side/back rather than the
+// correct partial wrap. That's actively wrong output, not just a missing feature,
+// so the flag hides the "Add Angle" UI and caps the app at a single base photo
+// until true perspective propagation is built. All multi-angle code is left intact
+// and reachable again by flipping this to true — nothing was deleted.
+const ENABLE_MULTI_ANGLE = false;
+const MAX_ANGLES = ENABLE_MULTI_ANGLE ? 4 : 1;
 const DEFAULT_PLACEMENT_BOX: PlacementBox = { x: 29, y: 20, width: 42, height: 56 };
 const DEFAULT_ADJUST: DesignAdjust = { scale: 100, rotate: 0, opacity: 100, saturation: 100, offsetX: 0, offsetY: 0 };
 
@@ -538,7 +547,11 @@ export default function App() {
     }
   };
 
-  const helperText = `${basePhotos.length} angle${basePhotos.length === 1 ? "" : "s"} loaded · add more perspective angles for deeper simulation`;
+  const helperText = ENABLE_MULTI_ANGLE
+    ? `${basePhotos.length} angle${basePhotos.length === 1 ? "" : "s"} loaded · add more perspective angles for deeper simulation`
+    : basePhotos.length === 0
+      ? "Upload a clear photo of the area you want to preview a tattoo on."
+      : "Base photo loaded.";
 
   // ---------------------------------------------------------------------
   // Phase 1 — Analyze / Confirm
