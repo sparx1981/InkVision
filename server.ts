@@ -281,6 +281,16 @@ Follow these rules strictly:
 - Output (crucial): a single photorealistic photograph of the same body part, same lighting, same skin tone, and same framing as IMAGE 1, with the design from IMAGE 2 seamlessly and permanently added as if freshly tattooed. The marked region must look visibly different from IMAGE 1 — pixel-identical or near-identical output to IMAGE 1 is always a failed result, never an acceptable one. Do not alter the person's identity or any unrelated background elements. This is a professional, realistic tattoo-session proposal image.${offFrameOverride}`;
 }
 
+// Appended to the normal blend prompt ONLY in the experimental wrap spike, when
+// a third image (IMAGE 3 = the same tattoo already applied on another angle of
+// the same limb) is supplied. Deliberately placed last so it overrides the base
+// prompt's "render the whole design" guidance for this continuation case.
+const WRAP_CONTINUATION_SUFFIX = `
+
+--- MULTI-ANGLE CONTINUATION (read this LAST — it overrides any earlier instruction that the whole design must be visible) ---
+You are ALSO given IMAGE 3: a photograph of the SAME person's SAME body part from a DIFFERENT camera angle, on which THIS EXACT tattoo has ALREADY been applied and finished. IMAGE 3 is the ground truth for how the finished tattoo actually looks — its motifs, linework, shading, proportions, and style. IMAGE 1 and IMAGE 3 are two views of ONE physical limb wearing ONE physical tattoo.
+Your job for IMAGE 1 is NOT to place a fresh, complete copy of the IMAGE 2 design. Instead, reproduce the SAME single tattoo shown in IMAGE 3 exactly as it would appear when the limb is seen from IMAGE 1's angle. Because a real tattoo wraps around a 3D limb, only the portion of it that actually faces this camera is visible from this angle — the rest curves away out of sight and must NOT be drawn. Match IMAGE 3's exact linework, shading, and style so the two images read as photographs of ONE continuous tattoo seen from two sides, never as two separate tattoos. If from this angle only a thin sliver of the tattoo wraps into view, render only that sliver — a partial, edge-on portion is the correct and expected result here, and is never a reason to enlarge, re-center, or complete the design to make it fully visible.`;
+
 const ANALYSIS_INSTRUCTION_SINGLE = `Look carefully at the attached photo of a tattooed body part.
 Respond with ONLY a raw JSON object — no markdown fences, no commentary — in exactly this shape:
 {"bodyPart": "...", "theme": "...", "description": "..."}
@@ -718,7 +728,14 @@ app.post("/api/composite-photorealistic", async (req, res) => {
     coverUp = false,
     aspectRatio = "1:1",
     designIsPreIsolated = true,
-    skinMaskApplied = false
+    skinMaskApplied = false,
+    // --- Multi-angle wrap spike (experimental; only sent when the client is
+    // in ?spike=wrap mode). referenceResultImage is the SAME tattoo already
+    // generated on a DIFFERENT angle of the same limb, passed so Gemini can
+    // continue one continuous tattoo across angles instead of stamping a fresh
+    // full copy on each. Off by default; absent for all normal generations. ---
+    referenceResultImage,
+    wrapMode = false
   } = req.body as {
     baseImage?: string;
     designImage?: string;
@@ -732,6 +749,8 @@ app.post("/api/composite-photorealistic", async (req, res) => {
     aspectRatio?: string;
     designIsPreIsolated?: boolean;
     skinMaskApplied?: boolean;
+    referenceResultImage?: string;
+    wrapMode?: boolean;
   };
 
   if (!baseImage || !designImage) {
@@ -759,8 +778,9 @@ app.post("/api/composite-photorealistic", async (req, res) => {
 
     const base = parseDataUrl(baseImage);
     const design = parseDataUrl(designImage);
+    const wrapReference = wrapMode && referenceResultImage ? parseDataUrl(referenceResultImage) : null;
 
-    const fullPrompt = buildBlendPrompt({
+    const baseBlendPrompt = buildBlendPrompt({
       bodyPart,
       theme,
       description,
@@ -772,16 +792,26 @@ app.post("/api/composite-photorealistic", async (req, res) => {
       designIsPreIsolated: designIsPreIsolated !== false
     });
 
-    console.log("Generating photorealistic blend with prompt:", fullPrompt);
+    // In wrap mode a third image (the same tattoo already applied on another
+    // angle) is supplied as ground truth, and the prompt is extended to ask for
+    // one continuous tattoo across angles rather than a fresh full copy here.
+    const fullPrompt = wrapReference ? baseBlendPrompt + WRAP_CONTINUATION_SUFFIX : baseBlendPrompt;
+
+    console.log(`Generating photorealistic blend${wrapReference ? " (WRAP MODE)" : ""} with prompt:`, fullPrompt);
+
+    const parts: any[] = [
+      { inlineData: { mimeType: base.mimeType, data: base.data } },
+      { inlineData: { mimeType: design.mimeType, data: design.data } }
+    ];
+    if (wrapReference) {
+      parts.push({ inlineData: { mimeType: wrapReference.mimeType, data: wrapReference.data } });
+    }
+    parts.push({ text: fullPrompt });
 
     const response = await generateContentWithRetry(ai, {
       model: "gemini-3.1-flash-lite-image",
       contents: {
-        parts: [
-          { inlineData: { mimeType: base.mimeType, data: base.data } },
-          { inlineData: { mimeType: design.mimeType, data: design.data } },
-          { text: fullPrompt }
-        ]
+        parts
       },
       config: {
         imageConfig: {

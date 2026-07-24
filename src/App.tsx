@@ -38,7 +38,18 @@ import { collection, doc, getDoc, getDocs, setDoc, updateDoc, increment } from "
 // until true perspective propagation is built. All multi-angle code is left intact
 // and reachable again by flipping this to true — nothing was deleted.
 const ENABLE_MULTI_ANGLE = false;
-const MAX_ANGLES = ENABLE_MULTI_ANGLE ? 4 : 1;
+
+// Experimental multi-angle WRAP spike — off for all normal users. Activated only
+// when the page URL carries ?spike=wrap, so it never affects the shipped product.
+// When on, it (a) re-enables the multi-angle UI so a second angle can be added,
+// and (b) generates non-primary angles with the primary angle's finished result
+// passed to Gemini as a "same tattoo, other angle" reference (see the wrapMode
+// path in /api/composite-photorealistic), to test whether a coherent wrap is
+// achievable before committing to build the feature for real.
+const SPIKE_WRAP =
+  typeof window !== "undefined" && new URLSearchParams(window.location.search).get("spike") === "wrap";
+
+const MAX_ANGLES = ENABLE_MULTI_ANGLE || SPIKE_WRAP ? 4 : 1;
 const DEFAULT_PLACEMENT_BOX: PlacementBox = { x: 29, y: 20, width: 42, height: 56 };
 const DEFAULT_ADJUST: DesignAdjust = { scale: 100, rotate: 0, opacity: 100, saturation: 100, offsetX: 0, offsetY: 0 };
 
@@ -640,7 +651,7 @@ export default function App() {
   // blend, once per angle). Every angle must be manually confirmed first —
   // no AI-guessed placement — but one click here generates all of them.
   // ---------------------------------------------------------------------
-  const generateOneAngle = async (photo: BasePhoto, designSrc: string, box: PlacementBox, analysis: TattooAnalysis) => {
+  const generateOneAngle = async (photo: BasePhoto, designSrc: string, box: PlacementBox, analysis: TattooAnalysis, wrapReferenceSrc?: string) => {
     const existingEntry = angleResults[photo.id];
     const isRepositioningCurrentRound = repositioningPhotoId === photo.id && !!existingEntry && !!placedThisRound[photo.id];
     const baseForBlend = isRepositioningCurrentRound
@@ -812,7 +823,11 @@ export default function App() {
           // on a clean white background. Uploaded reference images can have any
           // backdrop, so flag those explicitly and let the blend prompt strip
           // the background out instead of pasting it in as a flat sticker.
-          designIsPreIsolated: activeTab !== "upload"
+          designIsPreIsolated: activeTab !== "upload",
+          // Wrap spike only (undefined on every normal request): the same tattoo
+          // already generated on the primary angle, sent as a continuation
+          // reference so Gemini renders one continuous tattoo across angles.
+          ...(wrapReferenceSrc ? { referenceResultImage: wrapReferenceSrc, wrapMode: true } : {})
         })
       });
       const data2 = await safeJson(res2);
@@ -1023,12 +1038,22 @@ export default function App() {
         ? basePhotos.filter((p) => p.id === repositioningPhotoId)
         : basePhotos.filter((p) => !placedThisRound[p.id]);
 
+      // Wrap spike: generate the PRIMARY (active) angle first so its finished
+      // result can seed every other angle as a same-tattoo continuation
+      // reference. No effect on normal single-angle generation.
+      const orderedTargets = SPIKE_WRAP
+        ? [...targets].sort((a, b) => (a.id === activePhotoId ? -1 : b.id === activePhotoId ? 1 : 0))
+        : targets;
+
       let updatedResults = { ...angleResults };
-      for (let i = 0; i < targets.length; i++) {
-        const photo = targets[i];
-        if (targets.length > 1) setGenerationProgress({ current: i + 1, total: targets.length });
+      for (let i = 0; i < orderedTargets.length; i++) {
+        const photo = orderedTargets[i];
+        if (orderedTargets.length > 1) setGenerationProgress({ current: i + 1, total: orderedTargets.length });
         const box = draftPlacementBoxes[photo.id] || DEFAULT_PLACEMENT_BOX;
-        const entry = await generateOneAngle(photo, designSrc as string, box, analysis);
+        const wrapRef =
+          SPIKE_WRAP && photo.id !== activePhotoId ? updatedResults[activePhotoId]?.src : undefined;
+        if (wrapRef) console.log(`[SPIKE-WRAP] generating ${photo.name} with primary-angle reference`);
+        const entry = await generateOneAngle(photo, designSrc as string, box, analysis, wrapRef);
         updatedResults[photo.id] = entry;
       }
       setGenerationProgress(null);
