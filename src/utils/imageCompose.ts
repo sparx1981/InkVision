@@ -30,6 +30,7 @@ type Box = { x: number; y: number; width: number; height: number };
 // ---------------------------------------------------------------------
 
 // Multiclass Selfie Segmentation category indices (fixed by the model).
+const SEG_CATEGORY_BACKGROUND = 0;
 const SEG_CATEGORY_BODY_SKIN = 2;
 const SEG_CATEGORY_FACE_SKIN = 3;
 
@@ -88,7 +89,25 @@ function blurToSize(src: CanvasImageSource, srcW: number, srcH: number, width: n
  * no added server round-trip and no per-call Gemini cost, unlike the grid
  * classification this replaces.
  */
-export async function getSkinSegmentationMask(baseSrc: string): Promise<HTMLCanvasElement> {
+/**
+ * Runs segmentation ONCE and returns two different alpha-encoded masks:
+ *
+ * - `skin`: bare skin only (body-skin + face-skin categories). Precise when it
+ *   works, but QA found this classification unreliable on chests and legs —
+ *   it routinely marks obvious bare skin as non-skin. It is therefore only ever
+ *   used as a HINT (the burned tint) and as a retention-gated conditional clip.
+ *
+ * - `person`: the whole person silhouette — every category except background
+ *   (skin, hair, clothes, accessories). This is the person-vs-background
+ *   boundary, which is the thing this model is genuinely reliable at, on every
+ *   body part. It is safe to use as a HARD clip because it can never erase ink
+ *   that landed on the body: anything on the person passes through it. It
+ *   prevents both ink bleeding onto walls/floors AND the model widening the
+ *   limb to fill a placement box that overhangs the body's edge.
+ */
+export async function getSegmentationMasks(
+  baseSrc: string
+): Promise<{ skin: HTMLCanvasElement; person: HTMLCanvasElement }> {
   const img = await loadImage(baseSrc);
   const width = img.naturalWidth || img.width;
   const height = img.naturalHeight || img.height;
@@ -105,30 +124,51 @@ export async function getSkinSegmentationMask(baseSrc: string): Promise<HTMLCanv
   const mw = categoryMask.width;
   const mh = categoryMask.height;
 
-  const smallCanvas = document.createElement("canvas");
-  smallCanvas.width = mw;
-  smallCanvas.height = mh;
-  const smallCtx = smallCanvas.getContext("2d");
-  if (!smallCtx) throw new Error("Could not get 2D canvas context.");
-  const imageData = smallCtx.createImageData(mw, mh);
+  const skinCanvas = document.createElement("canvas");
+  skinCanvas.width = mw;
+  skinCanvas.height = mh;
+  const skinCtx = skinCanvas.getContext("2d");
+  const personCanvas = document.createElement("canvas");
+  personCanvas.width = mw;
+  personCanvas.height = mh;
+  const personCtx = personCanvas.getContext("2d");
+  if (!skinCtx || !personCtx) throw new Error("Could not get 2D canvas context.");
+
+  const skinData = skinCtx.createImageData(mw, mh);
+  const personData = personCtx.createImageData(mw, mh);
   for (let i = 0; i < maskData.length; i++) {
     const category = maskData[i];
     const isSkin = category === SEG_CATEGORY_BODY_SKIN || category === SEG_CATEGORY_FACE_SKIN;
+    const isPerson = category !== SEG_CATEGORY_BACKGROUND;
+    const o = i * 4;
     // RGB is irrelevant (destination-in only reads alpha) — always white so
-    // this is trivially inspectable/debuggable if ever drawn directly.
-    imageData.data[i * 4] = 255;
-    imageData.data[i * 4 + 1] = 255;
-    imageData.data[i * 4 + 2] = 255;
-    imageData.data[i * 4 + 3] = isSkin ? 255 : 0;
+    // these are trivially inspectable/debuggable if ever drawn directly.
+    skinData.data[o] = 255;
+    skinData.data[o + 1] = 255;
+    skinData.data[o + 2] = 255;
+    skinData.data[o + 3] = isSkin ? 255 : 0;
+    personData.data[o] = 255;
+    personData.data[o + 1] = 255;
+    personData.data[o + 2] = 255;
+    personData.data[o + 3] = isPerson ? 255 : 0;
   }
-  smallCtx.putImageData(imageData, 0, 0);
+  skinCtx.putImageData(skinData, 0, 0);
+  personCtx.putImageData(personData, 0, 0);
 
   // ImageSegmenterResult.close() frees BOTH the category mask and any
   // confidence masks in one call — calling categoryMask.close() separately
   // as well would double-free the same underlying resource.
   result.close();
 
-  return blurToSize(smallCanvas, mw, mh, width, height);
+  return {
+    skin: blurToSize(skinCanvas, mw, mh, width, height),
+    person: blurToSize(personCanvas, mw, mh, width, height)
+  };
+}
+
+/** Bare-skin mask only — see getSegmentationMasks. */
+export async function getSkinSegmentationMask(baseSrc: string): Promise<HTMLCanvasElement> {
+  return (await getSegmentationMasks(baseSrc)).skin;
 }
 
 /** Returns a copy of `maskCanvas` with its alpha channel inverted — used to
@@ -284,7 +324,7 @@ function drawImageCover(ctx: CanvasRenderingContext2D, img: HTMLImageElement, wi
  * real, undistorted skin. `drawImageCover` scales it uniformly instead, so
  * whatever gets cropped out keeps its true proportions.
  */
-export async function extractMaskedPatch(baseSrc: string, resultSrc: string, box: Box, skinMask?: HTMLCanvasElement): Promise<string> {
+export async function extractMaskedPatch(baseSrc: string, resultSrc: string, box: Box, skinMask?: HTMLCanvasElement, personMask?: HTMLCanvasElement): Promise<string> {
   const [baseImg, resultImg] = await Promise.all([loadImage(baseSrc), loadImage(resultSrc)]);
   const width = baseImg.naturalWidth || baseImg.width;
   const height = baseImg.naturalHeight || baseImg.height;
@@ -325,6 +365,13 @@ export async function extractMaskedPatch(baseSrc: string, resultSrc: string, box
 
   resultCtx.globalCompositeOperation = "destination-in";
   resultCtx.drawImage(buildFeatherMask(width, height, box), 0, 0);
+  // Person silhouette: ALWAYS applied as a hard clip (see getSegmentationMasks).
+  // Safe unconditionally because it only removes pixels outside the body, so it
+  // can never erase a design that landed on the person — it just stops ink on
+  // the background and stops the limb being widened to fill an overhanging box.
+  if (personMask) {
+    resultCtx.drawImage(personMask, 0, 0, personMask.width, personMask.height, 0, 0, width, height);
+  }
   if (useSkin && skinMask) {
     resultCtx.drawImage(skinMask, 0, 0, skinMask.width, skinMask.height, 0, 0, width, height);
   }
@@ -414,7 +461,7 @@ export function boxRelativeTo(box: Box, cropRegion: Box): Box {
  * extractMaskedPatch, so the result plugs into compositePatchWithAdjust
  * exactly the same way.
  */
-export async function extractCropPatch(baseSrc: string, resultSrc: string, cropRegion: Box, skinMask: HTMLCanvasElement, localBox: Box): Promise<string> {
+export async function extractCropPatch(baseSrc: string, resultSrc: string, cropRegion: Box, skinMask: HTMLCanvasElement, localBox: Box, personMask?: HTMLCanvasElement): Promise<string> {
   const [baseImg, resultImg] = await Promise.all([loadImage(baseSrc), loadImage(resultSrc)]);
   const baseWidth = baseImg.naturalWidth || baseImg.width;
   const baseHeight = baseImg.naturalHeight || baseImg.height;
@@ -458,6 +505,10 @@ export async function extractCropPatch(baseSrc: string, resultSrc: string, cropR
 
   patchCtx.globalCompositeOperation = "destination-in";
   patchCtx.drawImage(buildFeatherMask(pw, ph, localBox), 0, 0);
+  // Person silhouette hard clip — see the matching comment in extractMaskedPatch.
+  if (personMask) {
+    patchCtx.drawImage(personMask, 0, 0, personMask.width, personMask.height, 0, 0, pw, ph);
+  }
   if (useSkin) {
     patchCtx.drawImage(skinMask, 0, 0, skinMask.width, skinMask.height, 0, 0, pw, ph);
   }

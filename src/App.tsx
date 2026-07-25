@@ -14,7 +14,7 @@ import {
 } from "./types";
 import { PROMPT_SUGGESTIONS } from "./data/defaultAssets";
 import { generateTattooStencil } from "./utils/stencil";
-import { getImageOrientation, extractMaskedPatch, compositePatchWithAdjust, transformDesignGraphic, burnPlacementMarker, trimToContent, loadImage, cropToBox, getSkinSegmentationMask, burnSkinMaskFromSegmentation, isBoxOffFrame, computeCropRegion, boxRelativeTo, extractCropPatch, measureDesignBBox } from "./utils/imageCompose";
+import { getImageOrientation, extractMaskedPatch, compositePatchWithAdjust, transformDesignGraphic, burnPlacementMarker, trimToContent, loadImage, cropToBox, getSegmentationMasks, burnSkinMaskFromSegmentation, isBoxOffFrame, computeCropRegion, boxRelativeTo, extractCropPatch, measureDesignBBox } from "./utils/imageCompose";
 import { generateShareQrCode, buildTattooistShareUrl, downloadProjectZip, downloadImagesZip } from "./utils/tattooistShare";
 import TattooStage from "./components/TattooStage";
 import TattooControlPanel from "./components/TattooControlPanel";
@@ -710,18 +710,24 @@ export default function App() {
     let regionMaskApplied = false;
     let baseForMarking = baseForBlend;
     let skinMask: HTMLCanvasElement | undefined; // full-photo-space mask — off-frame path only
+    let personMask: HTMLCanvasElement | undefined; // full-photo-space silhouette — off-frame path only
     let cropRegion: PlacementBox | undefined;
     let cropSkinMask: HTMLCanvasElement | undefined; // crop-space mask — normal path only
+    let cropPersonMask: HTMLCanvasElement | undefined; // crop-space silhouette — normal path only
     let cropSrc: string | undefined;
     let localBox: PlacementBox = containBox;
     try {
       if (offFrame) {
-        skinMask = await getSkinSegmentationMask(baseForBlend);
+        const masks = await getSegmentationMasks(baseForBlend);
+        skinMask = masks.skin;
+        personMask = masks.person;
         baseForMarking = await burnSkinMaskFromSegmentation(baseForBlend, containBox, skinMask, coverUp);
       } else {
         cropRegion = computeCropRegion(containBox);
         cropSrc = await cropToBox(baseForBlend, cropRegion);
-        cropSkinMask = await getSkinSegmentationMask(cropSrc);
+        const masks = await getSegmentationMasks(cropSrc);
+        cropSkinMask = masks.skin;
+        cropPersonMask = masks.person;
         localBox = boxRelativeTo(containBox, cropRegion);
         baseForMarking = await burnSkinMaskFromSegmentation(cropSrc, localBox, cropSkinMask, coverUp);
       }
@@ -733,6 +739,7 @@ export default function App() {
       // full-photo box-only flow.
       cropRegion = undefined;
       cropSkinMask = undefined;
+      cropPersonMask = undefined;
       localBox = containBox;
     }
     const useCropFlow = !offFrame && !!cropRegion && !!cropSrc && !!cropSkinMask;
@@ -838,8 +845,8 @@ export default function App() {
       (window as any).__qaGeminiRaw = data2.imageUrl;
       console.log(`[QA] Gemini raw output captured (${(data2.imageUrl || "").length} chars)`);
       const patchSrc = useCropFlow
-        ? await extractCropPatch(baseForBlend, data2.imageUrl, cropRegion!, cropSkinMask!, localBox)
-        : await extractMaskedPatch(baseForBlend, data2.imageUrl, containBox, skinMask);
+        ? await extractCropPatch(baseForBlend, data2.imageUrl, cropRegion!, cropSkinMask!, localBox, cropPersonMask)
+        : await extractMaskedPatch(baseForBlend, data2.imageUrl, containBox, skinMask, personMask);
       return compositePatchWithAdjust(baseForBlend, patchSrc, containBox, DEFAULT_ADJUST);
     };
 
@@ -1505,6 +1512,15 @@ export default function App() {
     const referencePhoto = activePhoto || basePhotos[0];
     if (!referencePhoto) return;
 
+    // Use the actual GENERATED composite as the reference, not the bare base
+    // photo — the whole point of this sheet is to re-pose the design the person
+    // just approved, so the source of truth has to be that finished image (and
+    // the box it was placed in), never a fresh invention. Falls back to the
+    // base photo only if this angle hasn't been generated yet.
+    const generated = activePhotoId ? angleResults[activePhotoId] : null;
+    const sheetSourceSrc = generated?.src || referencePhoto.src;
+    const sheetPlacementBox = generated?.placementBox || (activePhotoId ? draftPlacementBoxes[activePhotoId] : undefined);
+
     if (!opts.silent) setShowReferenceSheetModal(true);
     setReferenceSheetLoading(true);
     setReferenceSheetSrc(null);
@@ -1524,7 +1540,12 @@ export default function App() {
           description: analysis.description,
           correction: correctionText,
           designImage: isolatedDesignSrc,
-          referenceImage: referencePhoto.src
+          referenceImage: sheetSourceSrc,
+          // Both new: tells the sheet that IMAGE 2 is the finished result to
+          // re-pose (not a body to reinvent), and exactly where on it the
+          // design sits, so placement carries across the panels.
+          referenceIsGeneratedResult: !!generated,
+          placementBox: sheetPlacementBox
         })
       });
       const data = await safeJson(res);
@@ -2094,7 +2115,12 @@ export default function App() {
   const ctaLabel = generating
     ? "Generating…"
     : !allAnglesReady
-    ? "Confirm placement on every angle"
+    ? // "every angle" only means something when there's more than one photo —
+      // with a single base photo it's just confusing (and duplicates the
+      // per-angle Confirm Placement button right next to it).
+      basePhotos.length > 1
+      ? "Confirm placement on every angle"
+      : "Confirm placement first"
     : "Generate Preview";
   const ctaDisabled = generating || analyzing || !allAnglesReady;
   const canAddAnother = !!currentAngleResult && !analyzing && !generating && !needsPlacement;

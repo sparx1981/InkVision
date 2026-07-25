@@ -669,12 +669,11 @@ export default function TattooControlPanel({
               {expanded.step3 && !effectiveDisabled && (
                 <button
                   onClick={() => {
-                    onSetBoxScale(100);
                     handleAdjustChange({ rotate: 0, opacity: 100, saturation: 100 });
                   }}
                   className="flex-none font-display text-[10px] uppercase cursor-pointer bg-transparent border-none ml-3"
                   style={{ color: "rgba(217,210,198,0.45)", letterSpacing: "0.06em" }}
-                  title="Reset Scale, Rotate, Opacity and Saturation to their defaults"
+                  title="Reset Rotate to its default"
                 >
                   Reset
                 </button>
@@ -684,26 +683,18 @@ export default function TattooControlPanel({
               <>
                 <div className="text-xs mb-3 leading-relaxed" style={{ color: "rgba(217,210,198,0.45)" }}>
                   {adjustEnabled
-                    ? "Fine-tune before generating — Scale resizes the placement box (drag it to reposition), Rotate/Opacity/Saturation apply to the design itself."
-                    : "Draw a placement box on the stage to enable these — they lock once generated. Use Reposition to adjust again."}
+                    ? "Rotate the design before generating. To change its size or position, drag or resize the placement box on the stage."
+                    : "Draw a placement box on the stage to enable this — it locks once generated. Use Reposition to adjust again."}
                 </div>
                 <div style={{ opacity: effectiveDisabled ? 0.4 : 1, transition: "opacity 0.15s" }}>
                   <div className="flex flex-col gap-3.5">
-                    <div>
-                      <div className={rowLabel} style={{ color: "rgba(236,231,224,0.6)" }}>
-                        <span>Scale</span>
-                        <span>{boxScalePercent}%</span>
-                      </div>
-                      <input
-                        type="range"
-                        className="iv-slider"
-                        min={50}
-                        max={150}
-                        value={boxScalePercent}
-                        disabled={effectiveDisabled}
-                        onChange={(e) => onSetBoxScale(Number(e.target.value))}
-                      />
-                    </div>
+                    {/* Scale, Ink Opacity and Saturation were removed deliberately.
+                        Scale duplicated (and fought) resizing the placement box, which
+                        IS the design's placement layer. Opacity/Saturation let a person
+                        dial the preview into something that no longer represents a real
+                        healed tattoo — actively misleading in a tool whose whole value is
+                        deciding on permanent ink. Rotate stays because it's the one
+                        adjustment you can't make by dragging the box. */}
                     <div>
                       <div className={rowLabel} style={{ color: "rgba(236,231,224,0.6)" }}>
                         <span>Rotate</span>
@@ -718,43 +709,6 @@ export default function TattooControlPanel({
                         disabled={effectiveDisabled}
                         onChange={(e) => handleAdjustChange({ rotate: Number(e.target.value) })}
                       />
-                    </div>
-                    <div>
-                      <div className={rowLabel} style={{ color: "rgba(236,231,224,0.6)" }}>
-                        <span>Ink Opacity</span>
-                        <span>{effectiveAdjust.opacity}%</span>
-                      </div>
-                      <input
-                        type="range"
-                        className="iv-slider"
-                        min={20}
-                        max={100}
-                        value={effectiveAdjust.opacity}
-                        disabled={effectiveDisabled}
-                        onChange={(e) => handleAdjustChange({ opacity: Number(e.target.value) })}
-                      />
-                    </div>
-                    <div>
-                      <div className={rowLabel} style={{ color: "rgba(217,210,198,0.6)" }}>
-                        <span>Saturation</span>
-                        <span>{effectiveAdjust.saturation}%</span>
-                      </div>
-                      <input
-                        type="range"
-                        className="iv-slider"
-                        min={0}
-                        max={100}
-                        value={effectiveAdjust.saturation}
-                        disabled={effectiveDisabled}
-                        onChange={(e) => handleAdjustChange({ saturation: Number(e.target.value) })}
-                      />
-                      <div
-                        className="flex justify-between font-mono uppercase mt-1"
-                        style={{ fontSize: 10, letterSpacing: "0.06em", color: "rgba(217,210,198,0.3)" }}
-                      >
-                        <span>Grayscale</span>
-                        <span>Vibrant</span>
-                      </div>
                     </div>
                   </div>
                 </div>

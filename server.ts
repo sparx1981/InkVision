@@ -252,7 +252,7 @@ Follow these rules strictly:
 - Aspect ratio (crucial): preserve IMAGE 2's own natural proportions exactly — never stretch, squash, or distort it. ${
     extendsOffFrame
       ? "Because this marked region intentionally runs off the edge of the photo, do NOT shrink or re-center the design to force the whole thing to fit inside the visible frame — instead scale it as if the full region (including the off-frame part) were visible, and simply let the portion outside the photo's own edge go uncropped/off-camera, showing only the in-frame slice."
-      : "The marked region's own shape has already been matched to this design's proportions — scale it up or down uniformly so it fills the marked region edge to edge, corner to corner. No centering or letterboxing judgment call is needed here: the brackets already mark exactly where the design belongs, at exactly the right shape."
+      : "The marked region's own shape has already been matched to this design's proportions — scale it up or down uniformly so it broadly fills the marked region, using the brackets as the intended size and position. IMPORTANT — this sizing guidance never overrides the body's real outline: if part of the marked region falls outside the body (on background, floor, wall, or empty space beyond the limb's edge), simply leave that part of the region empty and fit the design to the skin that genuinely exists inside it. NEVER widen, thicken, extend, or reshape the limb or body to fill more of the marked region — the body's silhouette in your output must match the original photo exactly, even when that means the design does not reach the bracket edges."
   }
 - Body accuracy (crucial): reproduce the exact same body shape, outline, proportions, and silhouette against the background as IMAGE 1 — the width, contour, and edge of the ${bodyPart} against its surroundings must match IMAGE 1 pixel-for-pixel in appearance, especially near the edges of the marked region. Do not slim, widen, reshape, or otherwise redraw the limb/body outline; only the ink on its surface changes, never the body's own geometry.
 - Skin-only guard (CRITICAL REQUIREMENT): the new design may ONLY be applied to real, bare human skin. The marked region is a rough guide drawn by a person and may not perfectly align with what's actually skin in the photo — if any part of it falls on clothing, fabric, a strap, a watch or other jewelry, hair, fingernails, or background/surface behind the body (a wall, door, floor, furniture, etc.), do NOT render any tattoo ink onto those non-skin surfaces under any circumstance. Confine the design to whatever actual bare skin is present at/near the marked region instead, shrinking, nudging, or cropping it as needed to keep it entirely on skin — never stretch it across or paint over an object, fabric, or surface that isn't the person's own skin. This includes the eyes: never draw ink on an eyeball, eyelid, or eyelid margin — treat that area as strictly off-limits, full stop, regardless of anything else in this prompt.
@@ -1073,7 +1073,9 @@ app.post("/api/generate-reference-sheet", async (req, res) => {
     description = "",
     correction = "",
     designImage,
-    referenceImage
+    referenceImage,
+    referenceIsGeneratedResult = false,
+    placementBox
   } = req.body as {
     bodyPart?: string;
     theme?: string;
@@ -1081,6 +1083,8 @@ app.post("/api/generate-reference-sheet", async (req, res) => {
     correction?: string;
     designImage?: string;
     referenceImage?: string;
+    referenceIsGeneratedResult?: boolean;
+    placementBox?: { x: number; y: number; width: number; height: number };
   };
 
   if (!designImage || !referenceImage) {
@@ -1128,16 +1132,31 @@ app.post("/api/generate-reference-sheet", async (req, res) => {
       ? `CRITICAL — cross-panel consistency: every panel shows the exact same fixed, permanent tattoo on the exact same body — only the camera angle changes between panels, never the ink itself. Before finalizing, check each panel against the others: if "${bodyPart}" (or the specific surface of it named, e.g. its back/side) would still be visible from a given pose's viewpoint given normal anatomy, that panel MUST show the same tattoo work in the same amount of visible detail as the other panels — do not let the ink fade out, shrink, soften, or disappear in a panel just because the camera angle changed (for example, a calf tattoo that wraps toward the back of the leg must still be at least partially visible in a rear/back view, not omitted entirely). Likewise, never let the tattoo appear on the wrong side, wrong limb, or wrong leg/arm in any single panel even if it was correct in the others — if you find yourself about to render a panel with no ink where the other panels show ink on a surface that this pose would also reveal, that panel is wrong and must be corrected before finishing. When genuinely uncertain whether a surface is visible in a given pose, err on the side of showing the tattoo rather than omitting it, since the entire purpose of this sheet is confirming how one single design reads consistently from multiple angles.`
       : "";
 
+    // When the client sends the finished composite (the normal case now), IMAGE 2
+    // is the approved result and this sheet is a RE-POSE of it — not a new
+    // invention. Previously this prompt asked for a "generic figure" that merely
+    // matched skin tone, and never received the placement box at all, so the
+    // sheet showed an imagined body with a guessed placement. Both are fixed here.
+    const boxNote = placementBox
+      ? ` The new design sits at approximately ${placementBox.width.toFixed(0)}% wide by ${placementBox.height.toFixed(0)}% tall of that photo, with its top-left corner about ${placementBox.x.toFixed(0)}% from the left and ${placementBox.y.toFixed(0)}% from the top — use this together with what you can see in IMAGE 2 to keep the design in the SAME anatomical position on the body in every panel.`
+      : "";
+
+    const sourceNote = referenceIsGeneratedResult
+      ? `IMAGE 2 is the APPROVED FINAL RESULT: a real photo of this specific person with the new tattoo already applied. It is the ground truth for this sheet in three ways — the person's actual body (build, proportions, skin tone), the exact appearance of the new design as inked, and its exact position and scale on the body.${boxNote}
+
+CRITICAL — re-pose, do not reinvent: your job is to show THIS SAME body wearing THIS SAME tattoo from ${layout === "single" ? "the specified viewpoint" : "the specified viewpoints"}, as if the same person were photographed again from a different angle. Reproduce the design's linework, size, and anatomical position exactly as they appear in IMAGE 2 — only the camera angle changes. Do NOT substitute a generic model, do NOT redraw or restyle the design, and do NOT move it to a different spot on the body than where IMAGE 2 clearly shows it.`
+      : `IMAGE 2 is a reference photo — loosely match this person's skin tone and body build for the generic figure. This is a reference figure for a tattoo artist, not a portrait, so exact facial likeness is not required or wanted.${boxNote}`;
+
     const instruction = `${layoutInstruction}
 
-IMAGE 2 is a reference photo — loosely match this person's skin tone and body build for the generic figure. This is a reference figure for a tattoo artist, not a portrait, so exact facial likeness is not required or wanted.
+${sourceNote}
 
 ${containmentNote}
 ${consistencyNote}
 
 On ${layout === "single" ? "the image" : "every one of the panels, where the confirmed location is actually visible in that pose"}, show:
 1. The existing tattoo work already at this location, themed as: ${theme}. ${description}
-2. The new tattoo design shown in IMAGE 1, applied in the same anatomically consistent spot relative to the existing work${isMultiPanel ? ", consistently across panels" : ""}.
+2. ${referenceIsGeneratedResult ? "The new tattoo design exactly as it already appears applied in IMAGE 2" : "The new tattoo design shown in IMAGE 1"}, in the same anatomically consistent spot relative to the existing work${isMultiPanel ? ", consistently across panels" : ""}.
 ${correctionLine}
 
 Style: clean, evenly lit studio photography look, consistent lighting and neutral background${isMultiPanel ? " across all panels so they read as one cohesive reference sheet" : ""}. ${captionNote} This is a professional tool for a tattoo artist to review the confirmed design and placement from the angle(s) that actually matter for it before a session — not a showcase of imaginary ink elsewhere on the body.`;
