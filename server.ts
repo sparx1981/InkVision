@@ -281,15 +281,13 @@ Follow these rules strictly:
 - Output (crucial): a single photorealistic photograph of the same body part, same lighting, same skin tone, and same framing as IMAGE 1, with the design from IMAGE 2 seamlessly and permanently added as if freshly tattooed. The marked region must look visibly different from IMAGE 1 — pixel-identical or near-identical output to IMAGE 1 is always a failed result, never an acceptable one. Do not alter the person's identity or any unrelated background elements. This is a professional, realistic tattoo-session proposal image.${offFrameOverride}`;
 }
 
-// Appended to the normal blend prompt ONLY in the experimental wrap spike, when
-// a third image (IMAGE 3 = the same tattoo already applied on another angle of
-// the same limb) is supplied. Deliberately placed last so it overrides the base
-// prompt's "render the whole design" guidance for this continuation case.
-const WRAP_CONTINUATION_SUFFIX = `
-
---- MULTI-ANGLE CONTINUATION (read this LAST — it overrides any earlier instruction that the whole design must be visible) ---
-You are ALSO given IMAGE 3: a photograph of the SAME person's SAME body part from a DIFFERENT camera angle, on which THIS EXACT tattoo has ALREADY been applied and finished. IMAGE 3 is the ground truth for how the finished tattoo actually looks — its motifs, linework, shading, proportions, and style. IMAGE 1 and IMAGE 3 are two views of ONE physical limb wearing ONE physical tattoo.
-Your job for IMAGE 1 is NOT to place a fresh, complete copy of the IMAGE 2 design. Instead, reproduce the SAME single tattoo shown in IMAGE 3 exactly as it would appear when the limb is seen from IMAGE 1's angle. Because a real tattoo wraps around a 3D limb, only the portion of it that actually faces this camera is visible from this angle — the rest curves away out of sight and must NOT be drawn. Match IMAGE 3's exact linework, shading, and style so the two images read as photographs of ONE continuous tattoo seen from two sides, never as two separate tattoos. If from this angle only a thin sliver of the tattoo wraps into view, render only that sliver — a partial, edge-on portion is the correct and expected result here, and is never a reason to enlarge, re-center, or complete the design to make it fully visible.`;
+// How many design variations one prompt produces. One prompt still costs the
+// user exactly ONE generation from their allowance — they're choosing between
+// samples of the same idea, not spending three goes. Kept at 3 deliberately:
+// 2 reads as a coin-flip rather than a choice, and beyond 3 the extra options
+// mostly add cost and choice-paralysis to what is meant to be a narrowing
+// decision about permanent ink.
+const DESIGN_VARIATION_COUNT = 3;
 
 const ANALYSIS_INSTRUCTION_SINGLE = `Look carefully at the attached photo of a tattooed body part.
 Respond with ONLY a raw JSON object — no markdown fences, no commentary — in exactly this shape:
@@ -657,6 +655,25 @@ app.post("/api/generate-tattoo-design", requireAuth, async (req, res) => {
     });
   }
 
+  // Real server-side enforcement of the generation allowance. This previously
+  // only existed as a client-side check (which could never fire, because usage
+  // was never recorded either) — so the free limit was effectively unlimited
+  // and every prompt was uncapped spend. Both halves are wired up now: refuse
+  // here when out of allowance, and record a generation once one succeeds.
+  let allowance;
+  try {
+    allowance = await checkGenerationAllowance(req.uid!);
+  } catch (error: any) {
+    console.error("Allowance check failed:", error);
+    return res.status(500).json({ error: "Couldn't verify your remaining generations. Please try again." });
+  }
+  if (!allowance.allowed) {
+    return res.status(402).json({
+      error: "You've used your free generation(s) for this period. Upgrade to keep generating designs.",
+      upgradeRequired: true
+    });
+  }
+
   try {
     const ai = new GoogleGenAI({
       apiKey,
@@ -674,7 +691,7 @@ app.post("/api/generate-tattoo-design", requireAuth, async (req, res) => {
       hasReferenceImage: !!referenceImage
     });
 
-    console.log("Generating isolated tattoo design with prompt:", fullPrompt);
+    console.log(`Generating ${DESIGN_VARIATION_COUNT} isolated tattoo design variations with prompt:`, fullPrompt);
 
     const parts: any[] = [];
     if (referenceImage) {
@@ -683,27 +700,52 @@ app.post("/api/generate-tattoo-design", requireAuth, async (req, res) => {
     }
     parts.push({ text: fullPrompt });
 
-    const response = await generateContentWithRetry(ai, {
-      model: "gemini-3.1-flash-lite-image",
-      contents: { parts },
-      config: { imageConfig: { aspectRatio: "1:1" } }
-    });
+    // One prompt = N independent samples, generated in PARALLEL so wall-clock
+    // stays roughly the same as a single generation. Independent calls (rather
+    // than one call asking for N) give genuinely different designs to choose
+    // between, which is the whole point. Counts as ONE generation against the
+    // user's allowance — see recordGeneration below.
+    const results = await Promise.allSettled(
+      Array.from({ length: DESIGN_VARIATION_COUNT }, () =>
+        generateContentWithRetry(ai, {
+          model: "gemini-3.1-flash-lite-image",
+          contents: { parts },
+          config: { imageConfig: { aspectRatio: "1:1" } }
+        })
+      )
+    );
 
-    let base64Image: string | null = null;
-    if (response?.candidates?.[0]?.content?.parts) {
-      for (const part of response.candidates[0].content.parts) {
+    const imageUrls: string[] = [];
+    for (const r of results) {
+      if (r.status !== "fulfilled") continue;
+      const responseParts = r.value?.candidates?.[0]?.content?.parts;
+      if (!responseParts) continue;
+      for (const part of responseParts) {
         if (part.inlineData?.data) {
-          base64Image = part.inlineData.data;
+          imageUrls.push(`data:image/png;base64,${part.inlineData.data}`);
           break;
         }
       }
     }
-    if (!base64Image) {
+
+    // Partial success is fine — the picker just shows fewer options. Only a
+    // total wipeout is an error, so one flaky sample never fails the request.
+    if (imageUrls.length === 0) {
+      const firstRejection = results.find((r) => r.status === "rejected") as PromiseRejectedResult | undefined;
+      if (firstRejection) throw firstRejection.reason;
       throw new Error("No image was returned from the Gemini API model response. Please check your prompt and try again.");
     }
 
-    const imageUrl = `data:image/png;base64,${base64Image}`;
-    res.json({ success: true, imageUrl });
+    try {
+      await recordGeneration(req.uid!);
+    } catch (error: any) {
+      // Never fail a successful generation just because the counter write did.
+      console.error("Failed to record generation usage:", error);
+    }
+
+    // `imageUrl` (singular) is kept for backward compatibility with any client
+    // that hasn't been updated to read the array.
+    res.json({ success: true, imageUrls, imageUrl: imageUrls[0] });
   } catch (error: any) {
     console.error("Isolated Design Generation Error:", error);
     res.status(500).json({
@@ -728,14 +770,7 @@ app.post("/api/composite-photorealistic", async (req, res) => {
     coverUp = false,
     aspectRatio = "1:1",
     designIsPreIsolated = true,
-    skinMaskApplied = false,
-    // --- Multi-angle wrap spike (experimental; only sent when the client is
-    // in ?spike=wrap mode). referenceResultImage is the SAME tattoo already
-    // generated on a DIFFERENT angle of the same limb, passed so Gemini can
-    // continue one continuous tattoo across angles instead of stamping a fresh
-    // full copy on each. Off by default; absent for all normal generations. ---
-    referenceResultImage,
-    wrapMode = false
+    skinMaskApplied = false
   } = req.body as {
     baseImage?: string;
     designImage?: string;
@@ -749,8 +784,6 @@ app.post("/api/composite-photorealistic", async (req, res) => {
     aspectRatio?: string;
     designIsPreIsolated?: boolean;
     skinMaskApplied?: boolean;
-    referenceResultImage?: string;
-    wrapMode?: boolean;
   };
 
   if (!baseImage || !designImage) {
@@ -778,9 +811,8 @@ app.post("/api/composite-photorealistic", async (req, res) => {
 
     const base = parseDataUrl(baseImage);
     const design = parseDataUrl(designImage);
-    const wrapReference = wrapMode && referenceResultImage ? parseDataUrl(referenceResultImage) : null;
 
-    const baseBlendPrompt = buildBlendPrompt({
+    const fullPrompt = buildBlendPrompt({
       bodyPart,
       theme,
       description,
@@ -792,26 +824,16 @@ app.post("/api/composite-photorealistic", async (req, res) => {
       designIsPreIsolated: designIsPreIsolated !== false
     });
 
-    // In wrap mode a third image (the same tattoo already applied on another
-    // angle) is supplied as ground truth, and the prompt is extended to ask for
-    // one continuous tattoo across angles rather than a fresh full copy here.
-    const fullPrompt = wrapReference ? baseBlendPrompt + WRAP_CONTINUATION_SUFFIX : baseBlendPrompt;
-
-    console.log(`Generating photorealistic blend${wrapReference ? " (WRAP MODE)" : ""} with prompt:`, fullPrompt);
-
-    const parts: any[] = [
-      { inlineData: { mimeType: base.mimeType, data: base.data } },
-      { inlineData: { mimeType: design.mimeType, data: design.data } }
-    ];
-    if (wrapReference) {
-      parts.push({ inlineData: { mimeType: wrapReference.mimeType, data: wrapReference.data } });
-    }
-    parts.push({ text: fullPrompt });
+    console.log("Generating photorealistic blend with prompt:", fullPrompt);
 
     const response = await generateContentWithRetry(ai, {
       model: "gemini-3.1-flash-lite-image",
       contents: {
-        parts
+        parts: [
+          { inlineData: { mimeType: base.mimeType, data: base.data } },
+          { inlineData: { mimeType: design.mimeType, data: design.data } },
+          { text: fullPrompt }
+        ]
       },
       config: {
         imageConfig: {

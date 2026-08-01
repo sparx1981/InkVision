@@ -39,17 +39,7 @@ import { collection, doc, getDoc, getDocs, setDoc, updateDoc, increment } from "
 // and reachable again by flipping this to true — nothing was deleted.
 const ENABLE_MULTI_ANGLE = false;
 
-// Experimental multi-angle WRAP spike — off for all normal users. Activated only
-// when the page URL carries ?spike=wrap, so it never affects the shipped product.
-// When on, it (a) re-enables the multi-angle UI so a second angle can be added,
-// and (b) generates non-primary angles with the primary angle's finished result
-// passed to Gemini as a "same tattoo, other angle" reference (see the wrapMode
-// path in /api/composite-photorealistic), to test whether a coherent wrap is
-// achievable before committing to build the feature for real.
-const SPIKE_WRAP =
-  typeof window !== "undefined" && new URLSearchParams(window.location.search).get("spike") === "wrap";
-
-const MAX_ANGLES = ENABLE_MULTI_ANGLE || SPIKE_WRAP ? 4 : 1;
+const MAX_ANGLES = ENABLE_MULTI_ANGLE ? 4 : 1;
 const DEFAULT_PLACEMENT_BOX: PlacementBox = { x: 29, y: 20, width: 42, height: 56 };
 const DEFAULT_ADJUST: DesignAdjust = { scale: 100, rotate: 0, opacity: 100, saturation: 100, offsetX: 0, offsetY: 0 };
 
@@ -189,6 +179,9 @@ export default function App() {
 
   // --- "Generate from Prompt" — isolated design + per-angle manual placement ---
   const [isolatedDesignSrc, setIsolatedDesignSrc] = useState<string | null>(null);
+  // One prompt returns several design variations; generation pauses here so the
+  // person can pick which one actually gets placed on their photo.
+  const [designChoices, setDesignChoices] = useState<string[] | null>(null);
   // Each photo's own in-progress placement box, keyed by photo id, so switching
   // angles never loses the box you drew for another angle.
   const [draftPlacementBoxes, setDraftPlacementBoxes] = useState<Record<string, PlacementBox>>({});
@@ -404,6 +397,7 @@ export default function App() {
 
   const resetGenerationState = () => {
     setIsolatedDesignSrc(null);
+    setDesignChoices(null);
     setDraftPlacementBoxes({});
     setDraftAdjustState({});
     setAngleResults({});
@@ -651,7 +645,7 @@ export default function App() {
   // blend, once per angle). Every angle must be manually confirmed first —
   // no AI-guessed placement — but one click here generates all of them.
   // ---------------------------------------------------------------------
-  const generateOneAngle = async (photo: BasePhoto, designSrc: string, box: PlacementBox, analysis: TattooAnalysis, wrapReferenceSrc?: string) => {
+  const generateOneAngle = async (photo: BasePhoto, designSrc: string, box: PlacementBox, analysis: TattooAnalysis) => {
     const existingEntry = angleResults[photo.id];
     const isRepositioningCurrentRound = repositioningPhotoId === photo.id && !!existingEntry && !!placedThisRound[photo.id];
     const baseForBlend = isRepositioningCurrentRound
@@ -744,33 +738,6 @@ export default function App() {
     }
     const useCropFlow = !offFrame && !!cropRegion && !!cropSrc && !!cropSkinMask;
 
-    // --- QA INSTRUMENTATION (temporary — TC-06 vanish diagnosis) ---
-    // Measures what fraction of the placement box the skin mask actually
-    // marked as skin. A near-zero value means extractCropPatch's destination-in
-    // clip will erase the whole design regardless of what Gemini paints.
-    if (useCropFlow && cropSkinMask) {
-      try {
-        const mctx = cropSkinMask.getContext("2d");
-        const mw = cropSkinMask.width;
-        const mh = cropSkinMask.height;
-        const bx = Math.max(0, Math.round((localBox.x / 100) * mw));
-        const by = Math.max(0, Math.round((localBox.y / 100) * mh));
-        const bw = Math.max(1, Math.round((localBox.width / 100) * mw));
-        const bh = Math.max(1, Math.round((localBox.height / 100) * mh));
-        const dat = mctx!.getImageData(bx, by, Math.min(bw, mw - bx), Math.min(bh, mh - by)).data;
-        let skin = 0;
-        const total = dat.length / 4;
-        for (let i = 3; i < dat.length; i += 4) if (dat[i] > 128) skin++;
-        const pct = total ? (skin / total) * 100 : 0;
-        console.log(`[QA] crop skin-mask coverage of placement box: ${pct.toFixed(1)}% (${skin}/${Math.round(total)} px), mask ${mw}x${mh}`);
-        (window as any).__qaCoverage = pct;
-        (window as any).__qaMaskDataUrl = cropSkinMask.toDataURL("image/png");
-        (window as any).__qaCropSrc = cropSrc;
-      } catch (e) {
-        console.log("[QA] coverage measure failed:", e);
-      }
-    }
-
     // Burn the placement marker onto a COPY of whichever image is actually
     // going to the AI (the crop, or the full photo) — on top of the region
     // mask tint, if one was applied — so the model can SEE the target
@@ -781,29 +748,6 @@ export default function App() {
     // uses the marked copy.
     const markedBaseSrc = await burnPlacementMarker(baseForMarking, useCropFlow ? localBox : containBox);
     const cropOrientation = useCropFlow ? await getImageOrientation(cropSrc!) : null;
-
-    // --- QA INSTRUMENTATION (temporary — TC-06 vanish diagnosis, full-photo path) ---
-    console.log(`[QA] flow: offFrame=${offFrame} useCropFlow=${useCropFlow} regionMaskApplied=${regionMaskApplied} skinMaskSet=${!!skinMask} containBox=${JSON.stringify(containBox)}`);
-    if (skinMask) {
-      try {
-        const smctx = skinMask.getContext("2d");
-        const smw = skinMask.width;
-        const smh = skinMask.height;
-        const sbx = Math.max(0, Math.round((containBox.x / 100) * smw));
-        const sby = Math.max(0, Math.round((containBox.y / 100) * smh));
-        const sbw = Math.max(1, Math.round((containBox.width / 100) * smw));
-        const sbh = Math.max(1, Math.round((containBox.height / 100) * smh));
-        const sdat = smctx!.getImageData(sbx, sby, Math.min(sbw, smw - sbx), Math.min(sbh, smh - sby)).data;
-        let sskin = 0;
-        const stotal = sdat.length / 4;
-        for (let i = 3; i < sdat.length; i += 4) if (sdat[i] > 128) sskin++;
-        console.log(`[QA] FULL-PHOTO skin-mask coverage of box: ${stotal ? (sskin / stotal * 100).toFixed(1) : "0"}% (${sskin}/${Math.round(stotal)} px), mask ${smw}x${smh}`);
-        (window as any).__qaFullCoverage = stotal ? (sskin / stotal) * 100 : 0;
-        (window as any).__qaSkinMaskUrl = skinMask.toDataURL("image/png");
-      } catch (e) {
-        console.log("[QA] full-photo coverage measure failed:", e);
-      }
-    }
 
     // One full generation attempt: call the blend API, then hard-mask the
     // result back onto baseForBlend so anything outside the intended region
@@ -830,20 +774,11 @@ export default function App() {
           // on a clean white background. Uploaded reference images can have any
           // backdrop, so flag those explicitly and let the blend prompt strip
           // the background out instead of pasting it in as a flat sticker.
-          designIsPreIsolated: activeTab !== "upload",
-          // Wrap spike only (undefined on every normal request): the same tattoo
-          // already generated on the primary angle, sent as a continuation
-          // reference so Gemini renders one continuous tattoo across angles.
-          ...(wrapReferenceSrc ? { referenceResultImage: wrapReferenceSrc, wrapMode: true } : {})
+          designIsPreIsolated: activeTab !== "upload"
         })
       });
       const data2 = await safeJson(res2);
       if (!res2.ok) throw new Error(data2.error || `Failed to generate the composite for ${photo.name}.`);
-      // --- QA INSTRUMENTATION (temporary — TC-06 vanish diagnosis) ---
-      // Capture Gemini's RAW output (before any client-side clip) so we can
-      // see whether the skull was ever painted, vs. erased by the mask clip.
-      (window as any).__qaGeminiRaw = data2.imageUrl;
-      console.log(`[QA] Gemini raw output captured (${(data2.imageUrl || "").length} chars)`);
       const patchSrc = useCropFlow
         ? await extractCropPatch(baseForBlend, data2.imageUrl, cropRegion!, cropSkinMask!, localBox, cropPersonMask)
         : await extractMaskedPatch(baseForBlend, data2.imageUrl, containBox, skinMask, personMask);
@@ -928,7 +863,10 @@ export default function App() {
     return entry;
   };
 
-  const handleGenerateComposite = async () => {
+  // `chosenDesignSrc` is supplied when the person has just picked one of the
+  // generated variations — it's already trimmed, so Stage A is skipped and we
+  // go straight to placing it.
+  const handleGenerateComposite = async (chosenDesignSrc?: string) => {
     if (!activePhoto || !activePhotoId) return;
     if (activeTab === "prompt" && !prompt.trim()) {
       setError("Describe the new tattoo you want before generating.");
@@ -971,7 +909,8 @@ export default function App() {
       // image chosen by the person — they skip Stage A entirely and go
       // straight into Stage B (the real photorealistic blend) using that
       // image directly, rather than the old flat client-side overlay.
-      let designSrc: string | null = activeTab === "prompt" ? isolatedDesignSrc : legacyDesignSrc;
+      let designSrc: string | null =
+        chosenDesignSrc || (activeTab === "prompt" ? isolatedDesignSrc : legacyDesignSrc);
       if (activeTab === "prompt" && !designSrc) {
         // Client-side allowance gate (the server enforces this too — this just
         // avoids an unnecessary round-trip). Admins and anyone with a
@@ -1012,18 +951,28 @@ export default function App() {
           }
           throw new Error(data.error || "Failed to generate the tattoo design.");
         }
+        // Usage was recorded server-side against this one prompt — refresh our
+        // local view of the remaining allowance.
+        await refreshProfile();
+
+        const choices: string[] = data.imageUrls?.length ? data.imageUrls : data.imageUrl ? [data.imageUrl] : [];
+        if (choices.length === 0) throw new Error("No designs were returned. Please try again.");
+
+        // More than one variation came back — stop here and let the person
+        // choose. Picking one calls back into this function with the chosen
+        // design, which resumes at the placement/composite step below.
+        if (choices.length > 1) {
+          setDesignChoices(choices);
+          setGenerating(false);
+          return;
+        }
+
         // Trim any margin Gemini left around the isolated design before it
         // becomes the placement layer — same reasoning as Upload/Portfolio,
         // Stage A's forced 1:1 square output isn't guaranteed to have the
         // artwork touch every edge.
-        designSrc = await trimToContent(data.imageUrl);
+        designSrc = await trimToContent(choices[0]);
         setIsolatedDesignSrc(designSrc);
-
-        // Usage + portfolio publishing already happened server-side (in the
-        // /api/generate-tattoo-design handler) — just refresh our local view
-        // of both rather than writing to Firestore again from the client.
-        await refreshProfile();
-        fetchPortfolio(); // this generation just auto-published a new design — refresh the list
       }
 
       // Keep the legacy `design` field populated for every tab (not just
@@ -1045,22 +994,12 @@ export default function App() {
         ? basePhotos.filter((p) => p.id === repositioningPhotoId)
         : basePhotos.filter((p) => !placedThisRound[p.id]);
 
-      // Wrap spike: generate the PRIMARY (active) angle first so its finished
-      // result can seed every other angle as a same-tattoo continuation
-      // reference. No effect on normal single-angle generation.
-      const orderedTargets = SPIKE_WRAP
-        ? [...targets].sort((a, b) => (a.id === activePhotoId ? -1 : b.id === activePhotoId ? 1 : 0))
-        : targets;
-
       let updatedResults = { ...angleResults };
-      for (let i = 0; i < orderedTargets.length; i++) {
-        const photo = orderedTargets[i];
-        if (orderedTargets.length > 1) setGenerationProgress({ current: i + 1, total: orderedTargets.length });
+      for (let i = 0; i < targets.length; i++) {
+        const photo = targets[i];
+        if (targets.length > 1) setGenerationProgress({ current: i + 1, total: targets.length });
         const box = draftPlacementBoxes[photo.id] || DEFAULT_PLACEMENT_BOX;
-        const wrapRef =
-          SPIKE_WRAP && photo.id !== activePhotoId ? updatedResults[activePhotoId]?.src : undefined;
-        if (wrapRef) console.log(`[SPIKE-WRAP] generating ${photo.name} with primary-angle reference`);
-        const entry = await generateOneAngle(photo, designSrc as string, box, analysis, wrapRef);
+        const entry = await generateOneAngle(photo, designSrc as string, box, analysis);
         updatedResults[photo.id] = entry;
       }
       setGenerationProgress(null);
@@ -1101,6 +1040,21 @@ export default function App() {
     }
   };
 
+  /** The person picked one of the generated variations — trim it, keep it as
+   *  the design for this round, and resume straight into placing it. */
+  const handleChooseDesign = async (choiceSrc: string) => {
+    setDesignChoices(null);
+    setGenerating(true);
+    try {
+      const trimmed = await trimToContent(choiceSrc);
+      setIsolatedDesignSrc(trimmed);
+      await handleGenerateComposite(trimmed);
+    } catch (err: any) {
+      setError(err.message || "Failed to use that design.");
+      setGenerating(false);
+    }
+  };
+
   const handleRepositionAngle = (photoId: string) => {
     const entry = angleResults[photoId];
     setDraftPlacementBoxes((prev) => ({ ...prev, [photoId]: entry ? entry.placementBox : DEFAULT_PLACEMENT_BOX }));
@@ -1130,6 +1084,7 @@ export default function App() {
   const handleAddAnotherTattoo = () => {
     setPrompt("");
     setIsolatedDesignSrc(null);
+    setDesignChoices(null);
     setDraftPlacementBoxes({});
     setDraftAdjustState({});
     setPlacedThisRound({});
@@ -2636,6 +2591,64 @@ export default function App() {
         </div>
       )}
 
+      {/* Design picker — one prompt produces several variations, and this is
+          where the person chooses which one actually gets placed. */}
+      {designChoices && designChoices.length > 0 && (
+        <div
+          className="fixed inset-0 flex items-center justify-center z-50 p-6"
+          style={{ background: "rgba(10,10,9,0.85)" }}
+        >
+          <div
+            className="rounded-2xl p-8"
+            style={{
+              width: 900,
+              maxWidth: "94vw",
+              maxHeight: "88vh",
+              overflowY: "auto",
+              background: "var(--iv-panel)",
+              border: "1px solid rgba(217,210,198,0.14)"
+            }}
+          >
+            <div className="font-display text-xl uppercase mb-1" style={{ letterSpacing: "0.06em", color: "var(--iv-ink)" }}>
+              Choose Your Design
+            </div>
+            <p className="text-xs mb-6 leading-relaxed" style={{ color: "rgba(217,210,198,0.5)" }}>
+              {designChoices.length} takes on your idea — pick the one you want to try on your photo. This didn&rsquo;t use
+              any extra generations.
+            </p>
+
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+              {designChoices.map((choice, i) => (
+                <button
+                  key={i}
+                  onClick={() => handleChooseDesign(choice)}
+                  className="rounded-xl p-2 cursor-pointer flex flex-col items-center gap-2 iv-design-choice"
+                  style={{ background: "#e8e5df", border: "1px solid rgba(217,210,198,0.18)" }}
+                >
+                  <img src={choice} alt={`Design option ${i + 1}`} className="w-full object-contain rounded-lg" />
+                  <span
+                    className="font-display text-[11px] uppercase pb-1"
+                    style={{ letterSpacing: "0.08em", color: "#0f0e0d" }}
+                  >
+                    Use this one
+                  </span>
+                </button>
+              ))}
+            </div>
+
+            <div className="flex justify-end mt-6">
+              <button
+                onClick={() => setDesignChoices(null)}
+                className="font-display text-[11px] uppercase py-2.5 px-5 rounded-lg cursor-pointer"
+                style={{ background: "transparent", border: "1px solid rgba(217,210,198,0.25)", color: "rgba(217,210,198,0.7)", letterSpacing: "0.08em" }}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Multi-Pose Reference Sheet Modal */}
       {showReferenceSheetModal && (
         <div
@@ -2669,9 +2682,9 @@ export default function App() {
             </div>
 
             <p className="text-xs mb-4 leading-relaxed" style={{ color: "rgba(217,210,198,0.5)" }}>
-              A generic reference figure showing the existing tattoo work and the new design together from four standard
-              poses — useful for reviewing the full design before a session. This is a generated reference, not a photo of
-              you specifically.
+              Your generated result re-posed from the standard angles for this body part, so you can review the new design
+              alongside your existing work before a session. Poses are AI-generated from your photo, so treat them as a
+              guide — the placement preview itself is the accurate one.
             </p>
 
             <div
