@@ -8,7 +8,10 @@
     "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js projects-db.json",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "test:unit": "tsx --test qa/geometry.test.ts",
+    "test:server": "node qa/server/build.mjs && node qa/server/run.cjs",
+    "test": "npm run test:unit && npm run test:server"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

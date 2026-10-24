@@ -5,3 +5,4 @@ dist
 projects-db.json
 portfolio-db.json
 db_fallback_*.json
+qa/server/.out

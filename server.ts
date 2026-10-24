@@ -1,6 +1,7 @@
 import express from "express";
 import path from "path";
 import fs from "fs";
+import { createHash, randomInt } from "crypto";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
 import { requireAuth, optionalAuth, requireAdmin } from "./authMiddleware.js";
@@ -50,23 +51,79 @@ app.post("/api/stripe-webhook", express.raw({ type: "application/json" }), async
   }
 });
 
-// Set up body parsers with generous limits to support base64 image uploads —
-// a multi-angle project (several photos + generated composites + history
-// snapshots) can genuinely reach tens of MB.
-app.use(express.json({ limit: "80mb" }));
-app.use(express.urlencoded({ limit: "80mb", extended: true }));
+// Behind Vercel / a reverse proxy req.ip would otherwise be the proxy's address,
+// which would make every per-IP rate limit below a single shared bucket.
+app.set("trust proxy", 1);
 
-// Path for project persistence
-const DB_PATH = path.join(process.cwd(), "projects-db.json");
+// Saved projects legitimately carry several photos + generated composites +
+// history snapshots, so that one route keeps a generous limit. Everything else
+// (the AI routes take one or two downscaled images) gets a much smaller cap so
+// an unauthenticated or abusive caller can't make the server buffer tens of MB
+// per request. Order matters: the first matching parser consumes the body.
+app.use("/api/projects", express.json({ limit: "80mb" }));
+app.use(express.json({ limit: "25mb" }));
+app.use(express.urlencoded({ limit: "1mb", extended: true }));
+
+/**
+ * Minimal in-memory sliding-window rate limiter. State is per server instance,
+ * so on serverless hosts (Vercel) the effective limit is per warm instance —
+ * still enough to stop a single client hammering one endpoint, but not a
+ * substitute for an edge/WAF rule if abuse becomes a real concern.
+ */
+function rateLimit(opts: { windowMs: number; max: number; by?: "uid" | "ip"; label: string }) {
+  const hits = new Map<string, number[]>();
+  let lastSweep = Date.now();
+  return (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const now = Date.now();
+    if (now - lastSweep > opts.windowMs) {
+      lastSweep = now;
+      for (const [k, v] of hits) {
+        if (!v.length || now - v[v.length - 1] > opts.windowMs) hits.delete(k);
+      }
+    }
+    const key = (opts.by === "uid" && req.uid) || req.ip || "unknown";
+    const recent = (hits.get(key) || []).filter((t) => now - t < opts.windowMs);
+    if (recent.length >= opts.max) {
+      const retryAfter = Math.max(1, Math.ceil((opts.windowMs - (now - recent[0])) / 1000));
+      res.setHeader("Retry-After", String(retryAfter));
+      return res.status(429).json({ error: `Too many ${opts.label} requests. Please wait ${retryAfter}s and try again.` });
+    }
+    recent.push(now);
+    hits.set(key, recent);
+    next();
+  };
+}
+
+// Per-endpoint limits. Generous for normal use (a person placing and re-placing
+// a design), tight enough to make scripted abuse expensive. Per-user for
+// signed-in routes, per-IP for the public code-based project lookup (which is
+// what stops a 6-character access code from being brute-forced).
+const aiLimiter = rateLimit({ windowMs: 60_000, max: 20, by: "uid", label: "AI" });
+const projectReadLimiter = rateLimit({ windowMs: 60_000, max: 30, by: "ip", label: "project lookup" });
+const projectWriteLimiter = rateLimit({ windowMs: 60_000, max: 20, by: "ip", label: "project save" });
+const likeLimiter = rateLimit({ windowMs: 60_000, max: 30, by: "uid", label: "like" });
 
 // --- Helpers for the two-phase "analyze then generate" tattoo flow ---
 
+/** A problem with what the caller sent (as opposed to a server/Gemini failure) — surfaces as HTTP 400. */
+class BadRequestError extends Error {}
+
+const ALLOWED_IMAGE_MIME = new Set(["image/png", "image/jpeg", "image/webp"]);
+
 function parseDataUrl(dataUrl: string): { mimeType: string; data: string } {
-  const match = /^data:(.+?);base64,(.+)$/.exec(dataUrl);
+  const match = typeof dataUrl === "string" ? /^data:(.+?);base64,(.+)$/.exec(dataUrl) : null;
   if (!match) {
-    throw new Error("Expected a base64 data URL for an uploaded image.");
+    throw new BadRequestError("Expected a base64 data URL for an uploaded image.");
   }
-  return { mimeType: match[1], data: match[2] };
+  if (!ALLOWED_IMAGE_MIME.has(match[1].toLowerCase())) {
+    throw new BadRequestError("Unsupported image type. Please use a PNG, JPEG or WebP image.");
+  }
+  return { mimeType: match[1].toLowerCase(), data: match[2] };
+}
+
+/** HTTP status for a caught error: 400 for caller mistakes, 500 for everything else. */
+function statusFor(error: any): number {
+  return error instanceof BadRequestError ? 400 : 500;
 }
 
 function extractJson(text: string): any {
@@ -328,23 +385,6 @@ Respond with ONLY a raw JSON object — no markdown fences, no commentary — in
 - "anglesConsistent": true if all the photos plausibly show the SAME body part on the SAME person from different angles; false if any of them clearly appear to be a genuinely different body part (e.g. one is an arm and another is a leg or chest/torso), a different person, or otherwise not a matching angle of the same area.
 - "anglesNote": if anglesConsistent is false, a short, specific, user-facing sentence naming which photo(s) look mismatched and why (e.g. "Photo 2 looks like a lower leg, not the forearm shown in your other photos."). If anglesConsistent is true, use an empty string.`;
 
-async function addToPortfolio(imageUrl: string, name: string) {
-  try {
-    if (!firestoreDb) return;
-    const id = "pf-" + Date.now() + "-" + Math.random().toString(36).slice(2, 7);
-    const item = {
-      id,
-      imageUrl,
-      name: name?.slice(0, 60) || "Untitled design",
-      likes: 0,
-      createdAt: new Date().toISOString()
-    };
-    await firestoreDb.collection("portfolio").doc(id).set(item);
-  } catch (error) {
-    console.error("Error adding to portfolio:", error);
-  }
-}
-
 // API: Check server health
 app.get("/api/health", (req, res) => {
   res.json({ status: "ok", time: new Date().toISOString() });
@@ -384,6 +424,10 @@ app.get("/api/me", requireAuth, async (req, res) => {
 
 // --- Admin account management (requireAuth + requireAdmin on every route below) ---
 
+const ACCOUNT_ROLES = ["consumer", "artist", "studio_admin", "admin"];
+const PLAN_TIERS = ["free", "design_pass", "artist_starter", "studio"];
+const SUBSCRIPTION_STATUSES = ["none", "active", "past_due", "canceled"];
+
 // API: list all accounts, for the admin panel
 app.get("/api/admin/users", requireAuth, requireAdmin, async (req, res) => {
   try {
@@ -404,6 +448,15 @@ app.patch("/api/admin/users/:uid", requireAuth, requireAdmin, async (req, res) =
     if (role) patch.role = role;
     if (tier) patch.tier = tier;
     if (subscriptionStatus) patch.subscriptionStatus = subscriptionStatus;
+    if (patch.role && !ACCOUNT_ROLES.includes(patch.role)) {
+      return res.status(400).json({ error: `role must be one of: ${ACCOUNT_ROLES.join(", ")}.` });
+    }
+    if (patch.tier && !PLAN_TIERS.includes(patch.tier)) {
+      return res.status(400).json({ error: `tier must be one of: ${PLAN_TIERS.join(", ")}.` });
+    }
+    if (patch.subscriptionStatus && !SUBSCRIPTION_STATUSES.includes(patch.subscriptionStatus)) {
+      return res.status(400).json({ error: `subscriptionStatus must be one of: ${SUBSCRIPTION_STATUSES.join(", ")}.` });
+    }
     const updated = await adminUpdateUser(uid, patch as any);
     res.json({ success: true, user: updated });
   } catch (error: any) {
@@ -452,6 +505,24 @@ app.post("/api/admin/users/:uid/refund", requireAuth, requireAdmin, async (req, 
   }
 });
 
+/**
+ * The site's own origin for Stripe return URLs. The Origin header is
+ * caller-controlled, so it's only honoured when it points at this same host;
+ * otherwise the request's own protocol + host is used. (Stops a crafted
+ * request from sending a customer to an attacker's page after paying.)
+ */
+function ownOrigin(req: express.Request): string {
+  const host = req.get("host") || "";
+  const fallback = `${req.protocol}://${host}`;
+  const origin = req.headers.origin;
+  if (!origin) return fallback;
+  try {
+    return new URL(origin).host === host ? origin : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 // --- Billing (Stripe) ---
 
 // API: start a checkout flow for a plan (one-time Design Pass, or Artist/Studio subscription)
@@ -462,7 +533,7 @@ app.post("/api/create-checkout-session", requireAuth, async (req, res) => {
     return res.status(500).json({ error: "Payments are not configured yet. Set STRIPE_SECRET_KEY and the STRIPE_PRICE_* env vars." });
   }
   try {
-    const origin = req.headers.origin || `${req.protocol}://${req.get("host")}`;
+    const origin = ownOrigin(req);
     const url = await createCheckoutSession({
       uid: req.uid!,
       email: req.userEmail || null,
@@ -483,7 +554,7 @@ app.post("/api/create-billing-portal-session", requireAuth, async (req, res) => 
     return res.status(500).json({ error: "Payments are not configured yet." });
   }
   try {
-    const origin = req.headers.origin || `${req.protocol}://${req.get("host")}`;
+    const origin = ownOrigin(req);
     const url = await createBillingPortalSession(req.uid!, `${origin}/`);
     res.json({ success: true, url });
   } catch (error: any) {
@@ -493,7 +564,7 @@ app.post("/api/create-billing-portal-session", requireAuth, async (req, res) => 
 });
 
 // API: Phase 1 — analyze uploaded photo(s) of existing tattoo work
-app.post("/api/analyze-tattoo", async (req, res) => {
+app.post("/api/analyze-tattoo", requireAuth, aiLimiter, async (req, res) => {
   const { images } = req.body as { images?: string[] };
 
   if (!images || !Array.isArray(images) || images.length === 0) {
@@ -550,92 +621,16 @@ app.post("/api/analyze-tattoo", async (req, res) => {
     });
   } catch (error: any) {
     console.error("Tattoo Analysis Error:", error);
-    res.status(500).json({
+    res.status(statusFor(error)).json({
       error: friendlyGeminiError(error, "Failed to analyze the uploaded photo.", "text"),
-      details: error.toString()
-    });
-  }
-});
-
-// Coarse grid size for the skin/ink detection pass below — fine enough to
-// capture the shape of open skin around existing ink, coarse enough for a
-// cheap Lite model to classify each cell reliably without hallucinating.
-const SKIN_INK_GRID_ROWS = 6;
-const SKIN_INK_GRID_COLS = 6;
-
-// API: classify a cropped placement-region image into a coarse grid of
-// skin / ink / mixed / background (see the comment above buildBlendPrompt for
-// why this exists). Runs for every generation regardless of Cover-Up mode now
-// — the "background" label lets Cover-Up-on generations get the same
-// visual-grounding protection against painting onto a wall/furniture near the
-// edge of the box that Cover-Up-off generations already got for skin-vs-ink.
-// The client crops just the marked region out of the base photo and sends
-// ONLY that crop here — the model classifying exactly what it's given is a
-// much stronger signal than asking it to also locate a described region
-// within a full photo.
-app.post("/api/detect-skin-regions", async (req, res) => {
-  const { croppedImage } = req.body as { croppedImage?: string };
-  if (!croppedImage) {
-    return res.status(400).json({ error: "A cropped region image is required." });
-  }
-
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey || apiKey === "MY_GEMINI_API_KEY" || apiKey.trim() === "") {
-    return res.status(400).json({
-      error: "Gemini API key is not configured. Please add your GEMINI_API_KEY in Settings > Secrets."
-    });
-  }
-
-  try {
-    const ai = new GoogleGenAI({
-      apiKey,
-      httpOptions: { headers: { "User-Agent": "aistudio-build" } }
-    });
-
-    const { mimeType, data } = parseDataUrl(croppedImage);
-    const rows = SKIN_INK_GRID_ROWS;
-    const cols = SKIN_INK_GRID_COLS;
-
-    const prompt = `This image is a close-up crop of a small region of a photograph of a person's body, which may contain existing tattoo ink and may also include some non-body content near its edges (clothing, jewelry, or whatever is behind/around the body). Mentally divide the ENTIRE image into an evenly spaced grid of exactly ${rows} rows by ${cols} columns (row-major order: left to right, then top to bottom, top-left cell first, bottom-right cell last).
-For EACH of the ${rows * cols} cells, classify what's actually shown as exactly one of these four labels:
-- "skin" — bare, open, untattooed human skin
-- "ink" — existing tattoo linework/shading covers most of the cell
-- "mixed" — roughly an even mix of skin and ink within that one cell
-- "background" — anything that is NOT the person's own bare skin or tattoo ink: clothing, fabric, a strap, jewelry, hair, fingernails, or anything behind/around the body such as a wall, floor, furniture, or other surface
-Respond with ONLY a raw JSON array of exactly ${rows * cols} strings (each one "skin", "ink", "mixed", or "background"), in row-major order — no markdown fences, no commentary, no other text.`;
-
-    const response = await generateContentWithRetry(ai, {
-      // gemini-3.5-flash-lite: same cheap single-shot vision-classification
-      // task as /api/analyze-tattoo above, doesn't need heavier reasoning.
-      model: "gemini-3.5-flash-lite",
-      contents: {
-        parts: [{ inlineData: { mimeType, data } }, { text: prompt }]
-      }
-    });
-
-    const text = response?.candidates?.[0]?.content?.parts?.map((p: any) => p.text || "").join("") || "";
-    if (!text.trim()) {
-      throw new Error("No classification was returned. Please try again.");
-    }
-
-    const cells = extractJson(text);
-    if (!Array.isArray(cells) || cells.length !== rows * cols) {
-      throw new Error("Skin/ink grid response was malformed.");
-    }
-
-    res.json({ success: true, rows, cols, cells });
-  } catch (error: any) {
-    console.error("Skin/Ink Detection Error:", error);
-    res.status(500).json({
-      error: friendlyGeminiError(error, "Failed to analyze open skin vs. existing ink in the marked region.", "text"),
-      details: error.toString()
+      details: process.env.NODE_ENV === "production" ? undefined : error.toString()
     });
   }
 });
 
 // API: Stage A — generate ONE isolated tattoo design (the single source of truth
 // that gets composited onto every angle, so the artwork itself never varies).
-app.post("/api/generate-tattoo-design", requireAuth, async (req, res) => {
+app.post("/api/generate-tattoo-design", requireAuth, aiLimiter, async (req, res) => {
   const {
     bodyPart,
     theme,
@@ -766,16 +761,16 @@ app.post("/api/generate-tattoo-design", requireAuth, async (req, res) => {
     res.json({ success: true, imageUrls, imageUrl: imageUrls[0] });
   } catch (error: any) {
     console.error("Isolated Design Generation Error:", error);
-    res.status(500).json({
+    res.status(statusFor(error)).json({
       error: friendlyGeminiError(error, "Failed to generate the tattoo design."),
-      details: error.toString()
+      details: process.env.NODE_ENV === "production" ? undefined : error.toString()
     });
   }
 });
 
 // API: Stage B — blend the (already-generated) design photorealistically onto a
 // specific base photo at a user-drawn placement box.
-app.post("/api/composite-photorealistic", async (req, res) => {
+app.post("/api/composite-photorealistic", requireAuth, aiLimiter, async (req, res) => {
   const {
     baseImage,
     designImage,
@@ -886,9 +881,9 @@ app.post("/api/composite-photorealistic", async (req, res) => {
     res.json({ success: true, imageUrl: `data:image/png;base64,${base64Image}` });
   } catch (error: any) {
     console.error("Photorealistic Composite Error:", error);
-    res.status(500).json({
+    res.status(statusFor(error)).json({
       error: friendlyGeminiError(error, "Failed to generate the photorealistic composite."),
-      details: error.toString()
+      details: process.env.NODE_ENV === "production" ? undefined : error.toString()
     });
   }
 });
@@ -905,7 +900,7 @@ app.post("/api/composite-photorealistic", async (req, res) => {
 // design: if this call itself errors, the client falls back to trusting the
 // generation as before, same non-blocking pattern as the skin/ink detection
 // pass above.
-app.post("/api/verify-tattoo-result", async (req, res) => {
+app.post("/api/verify-tattoo-result", requireAuth, aiLimiter, async (req, res) => {
   const { beforeCrop, afterCrop, coverUp = false } = req.body as {
     beforeCrop?: string;
     afterCrop?: string;
@@ -979,15 +974,15 @@ Respond with ONLY raw JSON, no markdown fences, no commentary, in exactly this s
     });
   } catch (error: any) {
     console.error("Verify Tattoo Result Error:", error);
-    res.status(500).json({
+    res.status(statusFor(error)).json({
       error: friendlyGeminiError(error, "Failed to verify the generated result.", "text"),
-      details: error.toString()
+      details: process.env.NODE_ENV === "production" ? undefined : error.toString()
     });
   }
 });
 
 // API: Suggest tattoo ideas tailored to the confirmed analysis ("Inspire me")
-app.post("/api/suggest-tattoo-ideas", async (req, res) => {
+app.post("/api/suggest-tattoo-ideas", requireAuth, aiLimiter, async (req, res) => {
   const { bodyPart, theme, description = "", correction = "" } = req.body as {
     bodyPart?: string;
     theme?: string;
@@ -1022,7 +1017,7 @@ Also propose ONE simple multiple-choice question that would help narrow down wha
 Respond with ONLY a raw JSON object, no markdown fences, in exactly this shape:
 {"ideas": ["...", "...", "...", "..."], "clarifyingQuestion": {"question": "...", "options": ["...", "...", "..."]}}`;
 
-    const response = await ai.models.generateContent({
+    const response = await generateContentWithRetry(ai, {
       // Same swap as /api/analyze-tattoo — plain text JSON generation, no
       // heavy reasoning required.
       model: "gemini-3.5-flash-lite",
@@ -1042,9 +1037,9 @@ Respond with ONLY a raw JSON object, no markdown fences, in exactly this shape:
     });
   } catch (error: any) {
     console.error("Tattoo Idea Suggestion Error:", error);
-    res.status(500).json({
+    res.status(statusFor(error)).json({
       error: friendlyGeminiError(error, "Failed to suggest tattoo ideas.", "text"),
-      details: error.toString()
+      details: process.env.NODE_ENV === "production" ? undefined : error.toString()
     });
   }
 });
@@ -1106,7 +1101,7 @@ function getPoseSet(bodyPart: string): { poses: string[]; layout: "single" | "gr
   };
 }
 
-app.post("/api/generate-reference-sheet", async (req, res) => {
+app.post("/api/generate-reference-sheet", requireAuth, aiLimiter, async (req, res) => {
   const {
     bodyPart,
     theme,
@@ -1201,7 +1196,7 @@ ${correctionLine}
 
 Style: clean, evenly lit studio photography look, consistent lighting and neutral background${isMultiPanel ? " across all panels so they read as one cohesive reference sheet" : ""}. ${captionNote} This is a professional tool for a tattoo artist to review the confirmed design and placement from the angle(s) that actually matter for it before a session — not a showcase of imaginary ink elsewhere on the body.`;
 
-    const response = await ai.models.generateContent({
+    const response = await generateContentWithRetry(ai, {
       model: "gemini-3.1-flash-lite-image",
       contents: {
         parts: [
@@ -1229,19 +1224,31 @@ Style: clean, evenly lit studio photography look, consistent lighting and neutra
     res.json({ success: true, imageUrl: `data:image/png;base64,${base64Image}` });
   } catch (error: any) {
     console.error("Reference Sheet Generation Error:", error);
-    res.status(500).json({
+    res.status(statusFor(error)).json({
       error: friendlyGeminiError(error, "Failed to generate the reference sheet."),
-      details: error.toString()
+      details: process.env.NODE_ENV === "production" ? undefined : error.toString()
     });
   }
 });
+
+// Portfolio items as the public sees them: the liker fingerprints never leave the server.
+function publicPortfolioItem(data: any) {
+  const { likedBy, ...rest } = data || {};
+  return rest;
+}
+
+// Stored per item instead of raw uids, so the (publicly readable) portfolio
+// documents never reveal which accounts liked what.
+function likerFingerprint(itemId: string, uid: string): string {
+  return createHash("sha256").update(`${itemId}:${uid}`).digest("hex").slice(0, 24);
+}
 
 app.get("/api/portfolio", async (req, res) => {
   try {
     if (!firestoreDb) throw new Error("Firestore is not configured.");
     const snap = await firestoreDb.collection("portfolio").limit(200).get();
-    const items = snap.docs.map(doc => doc.data());
-    
+    const items = snap.docs.map((doc: any) => publicPortfolioItem(doc.data()));
+
     const sorted = [...items].sort((a, b) => {
       if (b.likes !== a.likes) return b.likes - a.likes;
       return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
@@ -1253,88 +1260,108 @@ app.get("/api/portfolio", async (req, res) => {
   }
 });
 
-// API: like a portfolio design
-app.post("/api/portfolio/:id/like", async (req, res) => {
+// API: like a portfolio design — signed-in only, and one like per account per
+// design (repeat requests are no-ops that return the current count).
+app.post("/api/portfolio/:id/like", requireAuth, likeLimiter, async (req, res) => {
   try {
-    const { id } = req.params;
+    const id = String(req.params.id);
     if (!firestoreDb) throw new Error("Firestore is not configured.");
-    
+
     const docRef = firestoreDb.collection("portfolio").doc(id);
     const snap = await docRef.get();
     if (!snap.exists) {
       return res.status(404).json({ error: "Design not found." });
     }
-    
-    await docRef.update({
-      likes: (snap.data()?.likes || 0) + 1
-    });
-    
-    const updatedSnap = await docRef.get();
-    res.json({ success: true, item: updatedSnap.data() });
+
+    const data = snap.data() || {};
+    const fingerprint = likerFingerprint(id, req.uid!);
+    const likedBy: string[] = Array.isArray(data.likedBy) ? data.likedBy : [];
+    if (likedBy.includes(fingerprint)) {
+      return res.json({ success: true, alreadyLiked: true, item: publicPortfolioItem(data) });
+    }
+
+    const updated = { ...data, likes: (data.likes || 0) + 1, likedBy: [...likedBy, fingerprint] };
+    await docRef.update({ likes: updated.likes, likedBy: updated.likedBy });
+    res.json({ success: true, alreadyLiked: false, item: publicPortfolioItem(updated) });
   } catch (error: any) {
     console.error("Portfolio Like Error:", error);
     res.status(500).json({ error: "Failed to like this design." });
   }
 });
 
-// API: Save Project (Cross-Device persistence)
-app.post("/api/projects", optionalAuth, async (req, res) => {
-  try {
-    const projectData = req.body;
-    let code = projectData.code;
+// Project access codes: 6 characters from an unambiguous alphabet. Anything
+// else is rejected up front, so lookups can't be used to probe arbitrary
+// document ids in the collection.
+const PROJECT_CODE_RE = /^[A-HJ-NP-Z2-9]{6}$/;
+const PROJECT_CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
+function normalizeProjectCode(raw: unknown): string | null {
+  const code = String(raw ?? "").toUpperCase().trim();
+  return PROJECT_CODE_RE.test(code) ? code : null;
+}
+
+// API: Save Project (Cross-Device persistence).
+// Ownership rules: a project that belongs to an account can only be overwritten
+// by that account; an anonymous project (saved while signed out) stays editable
+// by whoever holds its code, which is what the share-by-code flow relies on —
+// and the first signed-in save over it claims it for that account.
+app.post("/api/projects", optionalAuth, projectWriteLimiter, async (req, res) => {
+  try {
+    const projectData = req.body && typeof req.body === "object" ? req.body : {};
     if (!firestoreDb) throw new Error("Firestore is not configured.");
     const projectsColl = firestoreDb.collection("projects");
 
-    // If no code, or code not exists, generate a new 6-char UPPERCASE alphanumeric code
-    let isNewCode = false;
-    if (!code) {
-      isNewCode = true;
-    } else {
+    let code = normalizeProjectCode(projectData.code);
+    let existingData: any = null;
+    if (code) {
       const snap = await projectsColl.doc(code).get();
-      if (!snap.exists) {
-        isNewCode = true;
+      if (snap.exists) {
+        existingData = snap.data();
+        if (existingData?.ownerUid && existingData.ownerUid !== req.uid) {
+          return res.status(403).json({
+            error: "This project belongs to another account, so it can't be overwritten. Save it as a new project instead.",
+            code: "PROJECT_OWNED"
+          });
+        }
+      } else {
+        code = null; // unknown code: issue a fresh one rather than letting callers pick ids
       }
     }
 
-    if (isNewCode) {
-      const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // clear readable chars
+    if (!code) {
       let attempt = 0;
       let exists = true;
       do {
         code = "";
         for (let i = 0; i < 6; i++) {
-          code += chars.charAt(Math.floor(Math.random() * chars.length));
+          code += PROJECT_CODE_CHARS.charAt(randomInt(PROJECT_CODE_CHARS.length));
         }
         const snap = await projectsColl.doc(code).get();
         exists = snap.exists;
         attempt++;
       } while (exists && attempt < 100);
+      if (exists) throw new Error("Could not generate a unique project code.");
     }
 
     const timestamp = new Date().toISOString();
-    
-    const existingSnap = await projectsColl.doc(code).get();
-    const existingData = existingSnap.exists ? existingSnap.data() : null;
-
     const savedProject = {
       ...projectData,
       code,
       createdAt: existingData?.createdAt || timestamp,
       updatedAt: timestamp,
       // Tags the project as belonging to the signed-in user, if any — this is
-      // what powers "Load Project" (listing your own saves) without requiring
-      // ownership for the existing code-based sharing flow to keep working.
+      // what powers "Load Project" (listing your own saves).
       ownerUid: req.uid || existingData?.ownerUid || null
     };
 
     await projectsColl.doc(code).set(savedProject);
 
+    const { ownerUid: _omit, ...publicProject } = savedProject;
     res.json({
       success: true,
       code,
       message: `Project saved successfully with access code: ${code}`,
-      project: savedProject,
+      project: publicProject,
     });
   } catch (error: any) {
     console.error("Save Project Error:", error);
@@ -1372,10 +1399,14 @@ app.get("/api/my-projects", requireAuth, async (req, res) => {
   }
 });
 
-// API: Load Project
-app.get("/api/projects/:code", async (req, res) => {
+// API: Load Project (by access code — the code is the capability, so lookups are
+// rate limited per IP and the owner's account id is never returned).
+app.get("/api/projects/:code", projectReadLimiter, async (req, res) => {
   try {
-    const code = req.params.code.toUpperCase().trim();
+    const code = normalizeProjectCode(req.params.code);
+    if (!code) {
+      return res.status(404).json({ error: "That isn't a valid project code." });
+    }
     if (!firestoreDb) throw new Error("Firestore is not configured.");
 
     const snap = await firestoreDb.collection("projects").doc(code).get();
@@ -1384,10 +1415,11 @@ app.get("/api/projects/:code", async (req, res) => {
       return res.status(404).json({ error: `Project not found for access code: ${code}` });
     }
 
+    const { ownerUid: _omit, ...project } = snap.data() || {};
     res.json({
       success: true,
       code,
-      project: snap.data(),
+      project,
     });
   } catch (error: any) {
     console.error("Load Project Error:", error);
@@ -1402,9 +1434,12 @@ app.get("/api/projects/:code", async (req, res) => {
 app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
   if (res.headersSent) return next(err);
   console.error("Unhandled server error:", err?.message || err);
+  if (err?.type === "entity.parse.failed") {
+    return res.status(400).json({ error: "The request body wasn't valid JSON." });
+  }
   if (err?.type === "entity.too.large" || err?.status === 413) {
     return res.status(413).json({
-      error: "This project is too large to save. Try removing some history entries or unused angle photos, then save again."
+      error: "That request is too large. Try a smaller photo, or remove some history entries or unused angle photos, then try again."
     });
   }
   res.status(err?.status || err?.statusCode || 500).json({

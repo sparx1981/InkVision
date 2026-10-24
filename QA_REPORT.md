@@ -6,98 +6,74 @@ Date: 2026-10-24 · Branch: `ccr-59ea2167-skkbdl`
 
 | Area | Status |
 |---|---|
-| `npm run lint` (tsc) and `npm run build` | Pass, before and after my changes |
-| Server routes (auth gating, validation, error handling) | Run locally with `curl` |
-| Landing and sign-in screens at 375, 820 and 1280 px | Run in headless Chromium, no JS errors, no horizontal overflow |
-| Client compositing pipeline (`imageCompose.ts`) | Run in headless Chromium against a **synthetic** arm photo and a **synthetic** design, including the real MediaPipe model |
-| Real Gemini output quality | **Not tested.** There is no `GEMINI_API_KEY` in this session. |
-| Studio screens, placement editor, adjustments, Stripe, admin panel | **Not exercised in a browser.** The studio is behind Firebase sign-in, and I did not create accounts in your production Firebase project. These were reviewed from code only. |
-| Real tattooed-skin photographs | **Not tested.** Findings about realism come from reading prompts and pipeline code plus the synthetic tests, not from looking at real outputs. |
+| `npm run lint`, `npm run build` | Pass |
+| `npm test` (new) | 7 geometry unit tests and 40 server checks pass. The server checks run the real Express app with Firebase stubbed and Gemini never called. |
+| Compositing pipeline in headless Chromium | Run against **synthetic** photos (a drawn "arm" with a dark ink blob, shadows, freckles, light and dark skin tones) with a **mocked** model output. The real MediaPipe segmenter ran. |
+| Photo upload helpers | Run in the browser with a 9.5 MB JPEG, a transparent PNG, an EXIF-rotated JPEG, a text file and a corrupt file |
+| Landing page at 375, 820 and 1280 px | No JS errors, no horizontal overflow |
+| Real Gemini output quality | **Not tested** (no key in this session) |
+| Real photographs of tattooed skin | **Not tested.** Ink detection in particular is a heuristic, checked only on synthetic images. |
+| Signed-in studio screens, Stripe, admin panel | **Not exercised in a browser.** Reviewed from code only, and the server routes were tested with a stubbed login. |
 
-## Fixed in this branch
-
-1. **Design vanishes when segmentation misses the body.**
-   - `extractMaskedPatch` and `extractCropPatch` applied the person-silhouette mask as an unconditional hard clip. Their comments called this "safe unconditionally".
-   - When MediaPipe classifies a photo as all background (close-ups of a limb with no head or torso in frame are the likely case), the whole design was erased.
-   - Reproduced with the real segmenter: before the fix the design vanished (`measureDesignBBox` returned null). After the fix it lands exactly on the box (30, 55, 35×25).
-   - The person mask now has the same retention safety net the skin mask already had (`PERSON_CLIP_MIN_RETENTION`).
-2. **Cover-Up mode didn't affect design generation.**
-   - Stage A (`/api/generate-tattoo-design`) never received `coverUp`.
-   - It always said "added next to an existing tattoo". Cover-Up got a sparse or light design, and the blend step then had to hide old ink under it.
-   - The flag is now passed, and the prompt asks for a dense, dark, high-coverage design that extends past the old outline.
-   - The non-cover-up prompt is unchanged.
-3. **Admin privilege escalation via an unverified email.**
-   - `ensureUserDoc` promoted any user whose email was in `ADMIN_EMAILS` (default `craigtrickett@gmail.com`).
-   - An email/password sign-up can claim an address without proving ownership.
-   - Promotion now requires the Firebase token's `email_verified`. Google sign-in is unaffected. If you use email/password for the admin account, verify that email.
-4. `.gitignore` now excludes `db_fallback_*.json`. The server writes these on start, and `push.bat` runs `git add .`.
-
-## Open issues, highest priority first
+## Fixed
 
 ### Security and cost
-- **S1. Anyone can read, list and overwrite every saved project (High).**
-  - `firestore.rules` has `projects … allow read, write: if true`, and the client reads and writes `projects` directly (`App.tsx`). Projects contain customers' body photos.
-  - I didn't change the rule because it would break the client's load and save flow. The fix is to move load and save fully behind the server API and set the rule to `false`.
-- **S2. `/api/projects` has no ownership check (High).**
-  - Verified: an anonymous POST with an existing code overwrote that project. A project saved as "t" was renamed to "HIJACKED" and read back.
-  - Codes are 6 characters from a 32-character alphabet, and `GET /api/projects/:code` is unauthenticated.
-- **S3. Most Gemini endpoints are unauthenticated and unmetered (High).**
-  - Only `generate-tattoo-design` checks sign-in and the free allowance.
-  - `analyze-tattoo`, `composite-photorealistic`, `verify-tattoo-result`, `suggest-tattoo-ideas` and `generate-reference-sheet` have no auth. Each generation also triggers a composite, a verify and possibly a retry, all uncounted.
-  - Verified they reach the Gemini key check without a token (HTTP 400 "key not configured", not 401), and a 6 MB body is accepted (the limit is 80 MB).
-  - Fix: add `requireAuth` to these routes and send the ID token from the client. Rate-limit them.
-- **S5. Portfolio is spam- and abuse-prone (Medium).** `portfolio create: if true` in the rules. The like endpoint is unauthenticated, so likes are unlimited, and it is a non-atomic read-modify-write.
-- **Minor:**
-  - Malformed JSON returns the parser's raw message.
-  - `parseDataUrl` doesn't check the MIME type.
-  - The checkout redirect URL is built from the `Origin` header.
-  - `generate-reference-sheet` skips `generateContentWithRetry`.
-  - The admin PATCH accepts arbitrary `role` and `tier` strings.
+- **Admin takeover.** `ADMIN_EMAILS` promotion now requires a verified email.
+- **Saved projects are no longer open to the public.**
+  - Load and save now go through `/api/projects`. The browser no longer reads or writes Firestore directly for projects.
+  - A project owned by an account can't be overwritten by anyone else. A signed-in user who loads someone else's project saves a copy of their own. A project saved while signed out stays editable by whoever holds its code. The first signed-in save over one claims it.
+  - Codes are validated and rate limited per IP (30 lookups a minute). The server issues all codes with `crypto.randomInt`, and the owner's account id is never returned.
+  - `firestore.rules` now denies all client access to `projects` and all client writes to `portfolio`. **This file isn't deployed by a git push. See "Deploying" below.**
+- **AI endpoints need sign-in and are rate limited.** Analyze, composite, verify, ideas and reference-sheet now require a signed-in user and are limited to 20 requests a minute each (per user). The client sends the ID token and shows "Sign in…" when there isn't one. Generation still enforces the free allowance as before.
+- **Request limits.** Request bodies are capped at 25 MB, except `/api/projects` at 80 MB. Data URLs must be PNG, JPEG or WebP (a bad one is a 400, not a 500). Bad JSON returns a generic message. Error `details` are no longer sent in production.
+- **Portfolio likes** need sign-in, count once per account (stored as hashes, never exposed) and are rate limited. The portfolio list is read through the API.
+- **Smaller fixes.**
+  - Admin PATCH validates `role`, `tier` and `subscriptionStatus`.
+  - Stripe return URLs only honour an `Origin` that matches the site's own host.
+  - Ideas and reference-sheet calls now retry on overload like the others.
+  - The dead `/api/detect-skin-regions` route, `burnSkinMask` and unused constants and files are gone.
+  - `db_fallback_*.json` is gitignored.
 
-### Output quality: placement, existing tattoos and cover-ups
-- **Q1. "Next to existing ink" is enforced by the prompt only.**
-  - In Cover-Up-off mode the green tint comes from the selfie model's skin class, which doesn't distinguish ink. No client clip restores old ink.
-  - The only check afterwards is an LLM before/after comparison.
-  - Recommended: build a pixel ink mask (dark or saturated pixels against the local skin median, or a text-prompted segmenter, see the RepoShelf list). After generation, restore base pixels under the dilated mask. That gives a real guarantee.
-- **Q2. No check that a cover-up actually covers the old tattoo.**
-  - `analyze-tattoo` returns text only, with no bounding box for existing ink.
-  - A placement box that only partly overlaps the old piece leaves a visible rim.
-  - Recommended: return `inkBox`, warn when the box doesn't enclose it with margin, and offer "fit to existing tattoo".
-- **Q3. Adjustments can push ink off the body.**
-  - The patch is clipped to the silhouette when generated, then scaled, rotated or offset in `compositePatchWithAdjust` with no re-clip.
-  - Measured on the synthetic test: scale 100% to 140% grew the footprint from 35×25 to 49×36 points of the frame. Silhouette edges move outward with it.
-  - Recommended: re-apply the person mask after the transform, or clamp the scale range.
-- **Q4. Aspect-ratio drift.**
-  - Gemini returns one of 14 fixed ratios and `drawImageCover` crops to fit.
-  - Worst case I forced (a squashed 1:1 return for a 3:4 photo) shifted the design 2.8 points left and 4.8 points wider.
-  - Real drift is smaller. Recommended: pad the crop to the exact target ratio before sending, then un-pad.
-- **Q5. Whitework, pastel and very light designs break trimming.**
-  - `trimToContent` treats brightness ≥ 235 as padding. The "whitework" option asks for white ink on a pure white background.
-  - Verified: a light design (#f0f0f0) on white is returned untrimmed, so the placement box is the whole square.
-  - Recommended: generate light designs on a mid-grey or black matte, or request alpha.
-- **Q6. The full body photo is sent to design generation.**
-  - `referenceImage: activePhoto.src` is the whole uncompressed photo. It's heavy and unnecessary.
-  - Send a downscaled crop of the existing ink for the colour-match instruction.
-- **Q7. Uploaded photos aren't resized or validated.**
-  - The code reads files straight to a data URL.
-  - There is no size cap, no downscale and no HEIC handling.
-  - On Vercel, request bodies are capped at about 4.5 MB (documented platform limit, not tested here), so large phone photos will fail against the 80 MB Express limit.
-- **Q8. Segmenter cold start is about 10 s and depends on CDNs.**
-  - In headless Chromium it took 10.5 s: WASM from jsDelivr plus the model from Google storage.
-  - Failure falls back silently to the box-only clip, so a CDN outage removes all background protection without telling the user.
-  - Recommended: preload on upload and self-host the assets.
-- **Output sharpness is unverified.** Gemini's output is stretched to the full photo or crop size. I couldn't judge sharpness without real output.
+### Placement, existing tattoos and cover-ups
+- **Design vanishing.** The person-silhouette clip is skipped when it would erase more than half the design, which is what happens when segmentation misses the body. Reproduced and fixed.
+- **Existing ink is now protected in the pixels (Cover-Up off).**
+  - The photo is analysed for existing ink. After generation the original pixels are restored wherever old ink was.
+  - On the synthetic test the old ink changed 98.5% of its pixels without protection and 0% with it.
+  - The "open skin" tint shown to the model now excludes ink.
+  - The detector declines to answer when its result looks implausible: too dark an image, more than 70% of the box flagged, blobs with soft edges, or restoration that would erase more than 85% of the design.
+- **Cover-Up helper.** In Cover-Up mode the UI warns when the placement box doesn't enclose the existing tattoo, and offers "Enlarge the box to cover it", which keeps the design's aspect ratio.
+- **Cover-Up design generation** now asks for a dense, dark, high-coverage design.
+- **Exact-ratio crops.** The region sent to the model is adjusted so its pixel aspect ratio is exactly one the model can return. This removes the crop-and-shift drift. Before, a deliberately mismatched ratio shifted a design by 2.8 points of the frame; with the exact-ratio crop and a mocked model output the design landed with 0 drift. Crops grow by up to 11% to get there.
+- **Pale designs.** `trimToContent` now judges content against the image's own border colour, so white-on-white and pastel designs trim properly. Dark backgrounds work too.
+- **Segmentation failure is no longer silent.** A toast says edge protection is off. Segmentation preloads when a photo is added (the first load took about 10 s in testing) and the MediaPipe bundle is split out of the main chunk (main bundle 1.30 MB to 1.00 MB).
+
+### Uploads and payloads
+- Photos and designs are validated (type, size under 30 MB), rotated by EXIF, and downscaled to 2560 px (photos) or 2048 px (designs). A 9.5 MB worst-case noise JPEG came out at 2.7 MB. Reference photos and analysis inputs are downscaled before sending (1024 and 1536 px), and the blend input to 2048 px.
 
 ### UI
-- **U1. Mobile landing has no navigation.** The nav is `hidden md:flex` with no mobile alternative, so Portfolio and Pricing are unreachable below 768 px. The title also touches both screen edges at 375 px.
-- **U2.** The landing page never reaches `networkidle` (Firebase keeps a connection open). This only affects automated tests.
+- The navigation (Studio / Portfolio / Pricing) now shows on phones. The title and footer no longer touch the screen edges at 375 px.
 
-### Code health
-- `/api/detect-skin-regions` and `burnSkinMask` are dead (no client caller).
-- `DB_PATH` is unused.
-- `_probe.txt` is an empty stray file.
-- The production bundle is one 1.3 MB chunk.
-- `ENABLE_MULTI_ANGLE = false`, but the off-frame and multi-angle prompt logic is still maintained.
+## Deploying
+1. Deploy the app first.
+2. Then deploy `firestore.rules` (for example `firebase deploy --only firestore:rules`, with your named database configured). Deploying the rules before the new client is live would break project load and save and portfolio likes for anyone on the old version.
+3. Behaviour changes to expect: analysis, ideas and blending need sign-in; likes need sign-in; projects owned by another account save as a copy.
+
+## Still open
+
+**Needs a Gemini key and real photos to verify**
+- Whether restoring ink over the old tattoo looks seamless at its edges. The mask is dilated and feathered, but I couldn't judge it on real output.
+- Whether the exact-ratio crop and the ink-free tint change the model's output for the better.
+- Whether the Cover-Up prompt produces designs that hide old ink in practice.
+- Ink detection on real photos: heavily tanned or very dark skin, ink under strong shadow, scars, hair and clothing. The guards decline when unsure, but they were tuned on synthetic images.
+- Output sharpness: the model's output is stretched back to the photo or crop size.
+- Whitework: the prompt still asks for white ink on a pure white background. Trimming copes now, but whether the model produces something usable is untested. The placement preview also uses multiply blending, which hides white.
+
+**Not done**
+- Rate limits are in memory, so on Vercel they apply per warm instance. For real abuse protection add an edge or WAF rule. The composite, verify and retry calls aren't counted against the generation allowance, only rate limited.
+- The segmentation model and WASM still load from jsDelivr and Google storage. Self-hosting them would remove that dependency.
+- The post-generation Adjustments panel no longer rescales the patch (`compositePatchWithAdjust` is only called with defaults), so my earlier finding that scaling could push ink off the body can't happen in the current flow. It would matter again if live scaling returns.
+- `ENABLE_MULTI_ANGLE = false`, but the multi-angle and off-frame prompt logic is still maintained.
+- Stripe checkout and webhooks, the admin panel UI and email/password sign-up weren't exercised.
 
 ## RepoShelf: listings that could help
 
@@ -108,10 +84,10 @@ I searched RepoShelf's catalog (about 80,000 entries, `dist/catalog.part-*.json`
 
 | Need | Listing | Why it could help |
 |---|---|---|
-| Real existing-ink mask (Q1, Q2) | `IDEA-Research/Grounded-Segment-Anything` | Text-prompted segmentation ("tattoo") would give a pixel mask and bounding box of old ink |
+| A stronger existing-ink mask (replacing the darkness heuristic) | `IDEA-Research/Grounded-Segment-Anything` | Text-prompted segmentation ("tattoo") would give a pixel mask and bounding box of old ink |
 | Body landmarks for placement and curvature | `vladmandic/human`, `open-mmlab/mmpose`, `CMU-Perceptual-Computing-Lab/openpose`, `LingDong-/handpose-facemesh-demos` | Limb axis and orientation to align and warp designs. `human` runs in the browser and has a demo |
 | Wrapping onto the body in 3D | `markomih/VolumetricSMPL`, `sha2nkt/deco` | Body-mesh work. This is heavy, so treat it as research rather than a quick win |
-| Clean design isolation / alpha (Q5) | `yossdotpro/removerized` (browser background removal), `ZHKKKe/MODNet`, `pymatting/pymatting` | Alpha cut-outs for uploaded reference designs instead of prompt-based "ignore the background" |
+| Clean design isolation / alpha | `yossdotpro/removerized` (browser background removal), `ZHKKKe/MODNet`, `pymatting/pymatting` | Alpha cut-outs for uploaded reference designs instead of prompt-based "ignore the background" |
 | Deterministic lighting match | `Erkaman/poisson_blend` | Seamless-clone reference for a post-pass that matches tone and edges |
 | Architecture analogues | `tryonlabs/opentryon`, `Miragic-AI/VirtualTryOn` (IDM-VTON), `DenRakEiw/scumble` | Virtual try-on is the same "warp onto a body and keep identity" problem. `scumble` is colour-matched layer inpainting |
 | Stencil export | `goku-open/goku-image-to-svg-tool` | Raster-to-SVG tracing to compare against `stencil.ts` |

@@ -14,7 +14,7 @@ import {
 } from "./types";
 import { PROMPT_SUGGESTIONS } from "./data/defaultAssets";
 import { generateTattooStencil } from "./utils/stencil";
-import { getImageOrientation, extractMaskedPatch, compositePatchWithAdjust, transformDesignGraphic, burnPlacementMarker, trimToContent, loadImage, cropToBox, getSegmentationMasks, burnSkinMaskFromSegmentation, isBoxOffFrame, computeCropRegion, boxRelativeTo, extractCropPatch, measureDesignBBox } from "./utils/imageCompose";
+import { getImageOrientation, extractMaskedPatch, compositePatchWithAdjust, transformDesignGraphic, burnPlacementMarker, trimToContent, loadImage, cropToBox, getSegmentationMasks, burnSkinMaskFromSegmentation, isBoxOffFrame, computeCropRegion, fitRegionToAspect, detectExistingInk, boxToCover, boxContains, preloadSegmenter, boxRelativeTo, extractCropPatch, measureDesignBBox } from "./utils/imageCompose";
 import { generateShareQrCode, buildTattooistShareUrl, downloadProjectZip, downloadImagesZip } from "./utils/tattooistShare";
 import TattooStage from "./components/TattooStage";
 import TattooControlPanel from "./components/TattooControlPanel";
@@ -26,8 +26,9 @@ import AdminPanel from "./AdminPanel";
 import PricingModal from "./PricingModal";
 import AccountMenu from "./AccountMenu";
 import LoadProjectModal from "./LoadProjectModal";
-import { signOutUser, getIdToken, db } from "./firebase";
-import { collection, doc, getDoc, getDocs, setDoc, updateDoc, increment } from "firebase/firestore";
+import { signOutUser, getIdToken } from "./firebase";
+import { authedFetch, maybeAuthedFetch, SignInRequiredError } from "./utils/api";
+import { readImageFile, downscaleForUpload, ImageUploadError, MAX_PHOTO_EDGE, MAX_DESIGN_EDGE } from "./utils/photo";
 
 // Multi-angle base photos are temporarily disabled (see below). The feature let
 // users upload the same body part from several angles, but each angle was placed
@@ -42,14 +43,6 @@ const ENABLE_MULTI_ANGLE = false;
 const MAX_ANGLES = ENABLE_MULTI_ANGLE ? 4 : 1;
 const DEFAULT_PLACEMENT_BOX: PlacementBox = { x: 29, y: 20, width: 42, height: 56 };
 const DEFAULT_ADJUST: DesignAdjust = { scale: 100, rotate: 0, opacity: 100, saturation: 100, offsetX: 0, offsetY: 0 };
-
-const readFileAsDataUrl = (file: File): Promise<string> =>
-  new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result as string);
-    reader.onerror = reject;
-    reader.readAsDataURL(file);
-  });
 
 /**
  * Parses a fetch Response as JSON, but fails with a clear message instead of
@@ -240,17 +233,11 @@ export default function App() {
     if (!tattooistShareCode) return;
     setTattooistLoading(true);
     setTattooistError(null);
-    if (!db) {
-      setTattooistError("Database is not configured.");
-      setTattooistLoading(false);
-      return;
-    }
-    getDoc(doc(db, "projects", tattooistShareCode.toUpperCase().trim()))
-      .then((snap) => {
-        if (!snap.exists()) {
-          throw new Error("That project code wasn't found.");
-        }
-        setTattooistProject(snap.data() as SavedProject);
+    fetch(`/api/projects/${encodeURIComponent(tattooistShareCode.toUpperCase().trim())}`)
+      .then(async (res) => {
+        const data = await safeJson(res);
+        if (!res.ok) throw new Error(data.error || "That project code wasn't found.");
+        setTattooistProject(data.project as SavedProject);
       })
       .catch((err) => setTattooistError(err.message || "That project code wasn't found."))
       .finally(() => setTattooistLoading(false));
@@ -286,6 +273,48 @@ export default function App() {
     });
   };
   const activePhotoDraftAdjust = (activePhotoId && draftAdjust[activePhotoId]) || DEFAULT_ADJUST;
+
+  // Cover-Up helper: when covering existing ink, check whether the placement
+  // box actually encloses the old tattoo. A box that only partly overlaps it
+  // leaves a visible rim of the old design, which no amount of prompting fixes.
+  // Heuristic and advisory only (see detectExistingInk) — it never blocks anything.
+  const [coverUpHint, setCoverUpHint] = useState<{ message: string; fixBox: PlacementBox | null } | null>(null);
+  const placingActivePhoto = !!activePhoto && (!currentAngleResult || repositioningPhotoId === activePhoto.id);
+  useEffect(() => {
+    if (!coverUp || !activePhoto || !placingActivePhoto) {
+      setCoverUpHint(null);
+      return;
+    }
+    let cancelled = false;
+    const baseSrc =
+      repositioningPhotoId === activePhoto.id && currentAngleResult
+        ? currentAngleResult.baseSrcForThisRound
+        : currentAngleResult?.src || activePhoto.src;
+    const timer = setTimeout(async () => {
+      try {
+        const ink = await detectExistingInk(baseSrc, placementBox);
+        if (cancelled) return;
+        if (!ink.bbox || (boxContains(placementBox, ink.bbox, 1.5) && !ink.extendsBeyondBbox)) {
+          setCoverUpHint(null);
+          return;
+        }
+        const fixBox = boxToCover(placementBox, ink.bbox);
+        setCoverUpHint({
+          message: fixBox
+            ? "Part of the existing tattoo sits outside your placement box, so it would stay visible around the new design."
+            : "The existing tattoo is larger than this design's box can cover — consider a bigger or differently shaped design.",
+          fixBox
+        });
+      } catch {
+        if (!cancelled) setCoverUpHint(null);
+      }
+    }, 450);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [coverUp, activePhotoId, activePhoto?.src, placementBox.x, placementBox.y, placementBox.width, placementBox.height, placingActivePhoto]);
   const setActiveDraftAdjust = (patch: Partial<DesignAdjust>) => {
     if (!activePhotoId) return;
     setDraftAdjustState((prev) => ({ ...prev, [activePhotoId]: { ...(prev[activePhotoId] || DEFAULT_ADJUST), ...patch } }));
@@ -444,7 +473,7 @@ export default function App() {
     // over from whatever project was open earlier in the session.
     const isFirstPhotoOfProject = basePhotos.length === 0;
     try {
-      const src = await readFileAsDataUrl(file);
+      const src = await readImageFile(file, { maxEdge: MAX_PHOTO_EDGE });
       const angleNames = ["Primary Angle", "Angle 2", "Angle 3", "Angle 4"];
       const newPhoto: BasePhoto = {
         id: "angle-" + Date.now(),
@@ -467,15 +496,16 @@ export default function App() {
       }
       setBasePhotos((prev) => [...prev, newPhoto]);
       setActivePhotoId(newPhoto.id);
+      preloadSegmenter(); // warm the skin/background model while they pick a design
       setToastMsg({ type: "success", text: "Added new perspective photo — draw its placement when you're ready." });
-    } catch {
-      setToastMsg({ type: "error", text: "Couldn't read that image file." });
+    } catch (err) {
+      setToastMsg({ type: "error", text: err instanceof ImageUploadError ? err.message : "Couldn't read that image file." });
     }
   };
 
   const handleUploadDesignFile = async (file: File) => {
     try {
-      const src = await readFileAsDataUrl(file);
+      const src = await readImageFile(file, { maxEdge: MAX_DESIGN_EDGE, keepAlpha: true });
       // Trim to the design's actual visible content before it becomes the
       // placement layer — uploaded files frequently have extra white margin
       // or a non-tight crop around the artwork (see trimToContent's comment
@@ -483,8 +513,8 @@ export default function App() {
       const trimmed = await trimToContent(src);
       setUploadedDesignSrc(trimmed);
       setToastMsg({ type: "success", text: "Reference tattoo design uploaded." });
-    } catch {
-      setToastMsg({ type: "error", text: "Couldn't read that design file." });
+    } catch (err) {
+      setToastMsg({ type: "error", text: err instanceof ImageUploadError ? err.message : "Couldn't read that design file." });
     }
   };
 
@@ -494,17 +524,18 @@ export default function App() {
   const fetchPortfolio = async () => {
     setPortfolioLoading(true);
     try {
-      if (!db) throw new Error("Firestore is not configured.");
-      const snap = await getDocs(collection(db, "portfolio"));
-      const items = snap.docs.map(doc => doc.data() as PortfolioItem);
-      
+      const res = await fetch("/api/portfolio");
+      const data = await safeJson(res);
+      if (!res.ok) throw new Error(data.error || "Failed to load the portfolio.");
+      const items = data.items as PortfolioItem[];
+
       const sorted = [...items].sort((a, b) => {
         if (b.likes !== a.likes) return b.likes - a.likes;
         return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
       });
       setPortfolioItems(sorted);
     } catch (err) {
-      console.error("Error fetching portfolio client-side:", err);
+      console.error("Error fetching portfolio:", err);
     } finally {
       setPortfolioLoading(false);
     }
@@ -541,14 +572,19 @@ export default function App() {
   };
 
   const handleLikePortfolioItem = async (id: string) => {
+    // Optimistic bump; rolled back below if the server says no (not signed in,
+    // already liked, rate limited, or a network failure).
     setPortfolioItems((prev) => prev.map((i) => (i.id === id ? { ...i, likes: i.likes + 1 } : i)));
+    const rollback = () => setPortfolioItems((prev) => prev.map((i) => (i.id === id ? { ...i, likes: Math.max(0, i.likes - 1) } : i)));
     try {
-      if (!db) return;
-      await updateDoc(doc(db, "portfolio", id), {
-        likes: increment(1)
-      });
-    } catch {
-      // optimistic update already applied; a failed like isn't worth bothering the user about
+      const res = await authedFetch(`/api/portfolio/${encodeURIComponent(id)}/like`, { method: "POST" });
+      const data = await safeJson(res);
+      if (!res.ok) throw new Error(data.error || "Couldn't register your like.");
+      if (data.alreadyLiked) rollback();
+      else if (data.item) setPortfolioItems((prev) => prev.map((i) => (i.id === id ? { ...i, likes: data.item.likes } : i)));
+    } catch (err: any) {
+      rollback();
+      setToastMsg({ type: "error", text: err instanceof SignInRequiredError ? "Sign in to like designs." : err.message || "Couldn't register your like." });
     }
   };
 
@@ -581,8 +617,8 @@ export default function App() {
     if (!opts.silent) setError(null);
     try {
       const otherAngles = basePhotos.filter((p) => p.id !== activePhotoId).map((p) => p.src);
-      const images = [activePhoto.src, ...otherAngles].slice(0, 4);
-      const res = await fetch("/api/analyze-tattoo", {
+      const images = await Promise.all([activePhoto.src, ...otherAngles].slice(0, 4).map((src) => downscaleForUpload(src, 1536)));
+      const res = await authedFetch("/api/analyze-tattoo", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ images })
@@ -610,7 +646,12 @@ export default function App() {
         // (see generateContentWithRetry), so a failure here means it's
         // genuinely down. A quiet toast is enough; Generate still has its
         // own fallback + notice if analysis never lands in time.
-        setToastMsg({ type: "error", text: "Couldn't analyze your photo automatically in the background — it'll use general context when you generate." });
+        setToastMsg({
+          type: "error",
+          text: err instanceof SignInRequiredError
+            ? "Sign in to analyze your photo and generate designs."
+            : "Couldn't analyze your photo automatically in the background — it'll use general context when you generate."
+        });
       } else {
         setError(message);
       }
@@ -710,23 +751,46 @@ export default function App() {
     let cropPersonMask: HTMLCanvasElement | undefined; // crop-space silhouette — normal path only
     let cropSrc: string | undefined;
     let localBox: PlacementBox = containBox;
+    // Existing-ink mask (Cover-Up OFF only), in the same pixel space as whichever
+    // image flow is used below (the crop, or the full photo). Where it applies,
+    // the original pixels are restored over old ink after generation, so
+    // "existing tattoos stay untouched" is enforced rather than requested.
+    let inkMask: HTMLCanvasElement | undefined;
+    const findInk = async (src: string, box: PlacementBox, skin?: HTMLCanvasElement) => {
+      if (coverUp) return undefined;
+      try {
+        return (await detectExistingInk(src, box, skin)).mask ?? undefined;
+      } catch {
+        return undefined; // best-effort: fall back to the prompt-only behaviour
+      }
+    };
     try {
       if (offFrame) {
         const masks = await getSegmentationMasks(baseForBlend);
         skinMask = masks.skin;
         personMask = masks.person;
-        baseForMarking = await burnSkinMaskFromSegmentation(baseForBlend, containBox, skinMask, coverUp);
+        inkMask = await findInk(baseForBlend, containBox, skinMask);
+        baseForMarking = await burnSkinMaskFromSegmentation(baseForBlend, containBox, skinMask, coverUp, inkMask);
       } else {
-        cropRegion = computeCropRegion(containBox);
+        // Crop to a region whose pixel aspect ratio is exactly one the image
+        // model returns, so mapping its output back never trims or stretches it.
+        cropRegion = fitRegionToAspect(computeCropRegion(containBox), containBox, orientation.width, orientation.height).region;
         cropSrc = await cropToBox(baseForBlend, cropRegion);
         const masks = await getSegmentationMasks(cropSrc);
         cropSkinMask = masks.skin;
         cropPersonMask = masks.person;
         localBox = boxRelativeTo(containBox, cropRegion);
-        baseForMarking = await burnSkinMaskFromSegmentation(cropSrc, localBox, cropSkinMask, coverUp);
+        inkMask = await findInk(cropSrc, localBox, cropSkinMask);
+        baseForMarking = await burnSkinMaskFromSegmentation(cropSrc, localBox, cropSkinMask, coverUp, inkMask);
       }
       regionMaskApplied = true;
     } catch {
+      // Tell the person: without segmentation nothing keeps ink off the
+      // background/clothing except the model's own judgement.
+      setToastMsg({
+        type: "error",
+        text: "Skin and background detection couldn't load, so the result isn't edge-protected — check its edges closely."
+      });
       // Silent fallback — see comment above. cropRegion/cropSrc may be
       // partially set; runOneAttempt below only trusts them alongside
       // cropSkinMask, so a failure here cleanly falls back to the
@@ -735,6 +799,8 @@ export default function App() {
       cropSkinMask = undefined;
       cropPersonMask = undefined;
       localBox = containBox;
+      // Existing-ink protection doesn't need the segmenter; redo it for the full-photo flow.
+      inkMask = await findInk(baseForBlend, containBox);
     }
     const useCropFlow = !offFrame && !!cropRegion && !!cropSrc && !!cropSkinMask;
 
@@ -746,7 +812,12 @@ export default function App() {
     // `baseForBlend` is still what every later step (patch extraction,
     // Adjustments, history) is built from — only this one outgoing request
     // uses the marked copy.
-    const markedBaseSrc = await burnPlacementMarker(baseForMarking, useCropFlow ? localBox : containBox);
+    // Downscaled for transport (the model resamples its input anyway); the
+    // placement maths all runs in percentages, so resolution doesn't matter here.
+    const markedBaseSrc = await downscaleForUpload(
+      await burnPlacementMarker(baseForMarking, useCropFlow ? localBox : containBox),
+      2048
+    );
     const cropOrientation = useCropFlow ? await getImageOrientation(cropSrc!) : null;
 
     // One full generation attempt: call the blend API, then hard-mask the
@@ -755,7 +826,7 @@ export default function App() {
     // request, an actual client-side guarantee — see extractCropPatch /
     // extractMaskedPatch).
     const runOneAttempt = async (): Promise<string> => {
-      const res2 = await fetch("/api/composite-photorealistic", {
+      const res2 = await authedFetch("/api/composite-photorealistic", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -780,8 +851,8 @@ export default function App() {
       const data2 = await safeJson(res2);
       if (!res2.ok) throw new Error(data2.error || `Failed to generate the composite for ${photo.name}.`);
       const patchSrc = useCropFlow
-        ? await extractCropPatch(baseForBlend, data2.imageUrl, cropRegion!, cropSkinMask!, localBox, cropPersonMask)
-        : await extractMaskedPatch(baseForBlend, data2.imageUrl, containBox, skinMask, personMask);
+        ? await extractCropPatch(baseForBlend, data2.imageUrl, cropRegion!, cropSkinMask!, localBox, cropPersonMask, inkMask)
+        : await extractMaskedPatch(baseForBlend, data2.imageUrl, containBox, skinMask, personMask, inkMask);
       return compositePatchWithAdjust(baseForBlend, patchSrc, containBox, DEFAULT_ADJUST);
     };
 
@@ -801,7 +872,7 @@ export default function App() {
     try {
       const verify = async (afterSrc: string): Promise<{ verdict: "pass" | "fail"; reason: string }> => {
         const [beforeCrop, afterCrop] = await Promise.all([cropToBox(baseForBlend, containBox), cropToBox(afterSrc, containBox)]);
-        const resVerify = await fetch("/api/verify-tattoo-result", {
+        const resVerify = await authedFetch("/api/verify-tattoo-result", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ beforeCrop, afterCrop, coverUp })
@@ -940,7 +1011,8 @@ export default function App() {
             prompt,
             style,
             colorPreference,
-            referenceImage: activePhoto.src,
+            // The model only needs the ink's tone and age, not full resolution.
+            referenceImage: await downscaleForUpload(activePhoto.src, 1024, 0.85),
             coverUp
           })
         });
@@ -1122,7 +1194,7 @@ export default function App() {
     try {
       const analysis = await ensureAnalysis();
       if (!analysis) throw new Error("Couldn't analyze your photo to tailor ideas.");
-      const res = await fetch("/api/suggest-tattoo-ideas", {
+      const res = await authedFetch("/api/suggest-tattoo-ideas", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1228,13 +1300,11 @@ export default function App() {
     }
     setToastMsg({ type: "success", text: `Retrieving project ${trimmed}...` });
     try {
-      if (!db) throw new Error("Firestore is not configured.");
-      const snap = await getDoc(doc(db, "projects", trimmed));
-      if (!snap.exists()) {
-        throw new Error("Project not found.");
-      }
+      const res = await fetch(`/api/projects/${encodeURIComponent(trimmed)}`);
+      const data = await safeJson(res);
+      if (!res.ok) throw new Error(data.error || "Project not found.");
 
-      const loaded: SavedProject = snap.data() as SavedProject;
+      const loaded: SavedProject = data.project as SavedProject;
       setBasePhotos(loaded.basePhotos || []);
       setActivePhotoId(loaded.activePhotoId || null);
       setDesign(loaded.design || { src: null, name: "", sourceMode: "prompt", renderMode: "overlay" });
@@ -1278,43 +1348,11 @@ export default function App() {
   const handleSaveProject = async () => {
     setSaving(true);
     try {
-      if (!db) throw new Error("Firestore is not configured.");
-      let code = projectCode;
-
-      let isNewCode = false;
-      if (!code) {
-        isNewCode = true;
-      } else {
-        const snap = await getDoc(doc(db, "projects", code));
-        if (!snap.exists()) {
-          isNewCode = true;
-        }
-      }
-
-      if (isNewCode) {
-        const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-        let attempt = 0;
-        let exists = true;
-        do {
-          code = "";
-          for (let i = 0; i < 6; i++) {
-            code += chars.charAt(Math.floor(Math.random() * chars.length));
-          }
-          const snap = await getDoc(doc(db, "projects", code));
-          exists = snap.exists();
-          attempt++;
-        } while (exists && attempt < 100);
-      }
-
-      if (!code) throw new Error("Could not generate a unique project code.");
-
-      const timestamp = new Date().toISOString();
-      const projectRef = doc(db, "projects", code);
-      const existingSnap = await getDoc(projectRef);
-      const existingData = existingSnap.exists() ? existingSnap.data() : null;
-
-      const payload: SavedProject & { ownerUid: string | null } = {
-        code,
+      // The server decides the access code (and checks ownership): it keeps the
+      // current code when this project is yours (or anonymous), and issues a
+      // fresh one for a new project or one that belongs to someone else.
+      const payload: SavedProject = {
+        code: projectCode || undefined,
         name: projectName,
         basePhotos,
         activePhotoId,
@@ -1324,15 +1362,25 @@ export default function App() {
         sliderX,
         history,
         isolatedDesignSrc,
-        angleResults,
-        createdAt: existingData?.createdAt || timestamp,
-        updatedAt: timestamp,
-        // Needed for "Load Project" to find this user's own saves — without
-        // this, every save was untagged and Load Project would always be empty.
-        ownerUid: user?.uid || (existingData as any)?.ownerUid || null
-      };
+        angleResults
+      } as SavedProject;
 
-      await setDoc(projectRef, payload);
+      const post = (body: SavedProject) =>
+        maybeAuthedFetch("/api/projects", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body)
+        });
+
+      let res = await post(payload);
+      let data = await safeJson(res);
+      if (res.status === 403 && data.code === "PROJECT_OWNED") {
+        // Someone else's project (e.g. loaded by code): save a copy of your own.
+        res = await post({ ...payload, code: undefined } as SavedProject);
+        data = await safeJson(res);
+      }
+      if (!res.ok) throw new Error(data.error || "Failed to save project.");
+      const code: string = data.code;
 
       setProjectCode(code);
       setShowSaveModal(true);
@@ -1487,7 +1535,7 @@ export default function App() {
           theme: "unspecified — infer style and any existing ink directly from the reference photo",
           description: ""
         };
-      const res = await fetch("/api/generate-reference-sheet", {
+      const res = await authedFetch("/api/generate-reference-sheet", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1496,7 +1544,7 @@ export default function App() {
           description: analysis.description,
           correction: correctionText,
           designImage: isolatedDesignSrc,
-          referenceImage: sheetSourceSrc,
+          referenceImage: await downscaleForUpload(sheetSourceSrc, 1536),
           // Both new: tells the sheet that IMAGE 2 is the finished result to
           // re-pose (not a body to reinvent), and exactly where on it the
           // design sits, so placement carries across the panels.
@@ -1929,8 +1977,10 @@ export default function App() {
         )}
 
         {/* Minimal Navigation Topbar */}
-        <header className="flex-none flex items-center justify-center px-12 border-b border-white/5" style={{ height: 90 }}>
-          <div className="hidden md:flex items-center gap-8 text-[10px] tracking-[0.25em] font-medium text-[#d9d2c6]/60">
+        <header className="flex-none flex items-center justify-center px-4 md:px-12 border-b border-white/5" style={{ height: 90 }}>
+          {/* Same links on every screen size — previously the whole nav was
+              hidden below 768px, leaving Portfolio and Pricing unreachable on phones. */}
+          <div className="flex items-center gap-4 md:gap-8 text-[10px] tracking-[0.2em] md:tracking-[0.25em] font-medium text-[#d9d2c6]/60">
             <button onClick={goToStudio} className="hover:text-amber-500 transition-colors duration-300 uppercase cursor-pointer">
               Studio
             </button>
@@ -1974,7 +2024,7 @@ export default function App() {
             Tattoo Studio
           </div>
 
-          <h1 className="font-display text-5xl md:text-8xl tracking-[0.22em] font-bold text-[#d9d2c6] mb-6 leading-none select-none uppercase">
+          <h1 className="font-display text-4xl sm:text-5xl md:text-8xl tracking-[0.22em] pl-[0.22em] font-bold text-[#d9d2c6] mb-6 leading-none select-none uppercase">
             INKVISION
           </h1>
 
@@ -2043,7 +2093,7 @@ export default function App() {
           </div>
         </div>
 
-        <footer className="flex-none py-6 text-center text-[9px] tracking-[0.15em] uppercase text-white/20 select-none border-t border-white/5">
+        <footer className="flex-none py-6 px-4 text-center text-[9px] tracking-[0.15em] uppercase text-white/20 select-none border-t border-white/5">
           InkVision Studio &copy; 2026 &mdash; Professional Pre-Visualization
         </footer>
       </div>
@@ -2228,6 +2278,8 @@ export default function App() {
             onLikePortfolioItem={handleLikePortfolioItem}
             coverUp={coverUp}
             onToggleCoverUp={() => setCoverUp((v) => !v)}
+            coverUpHint={coverUpHint ? { message: coverUpHint.message, canFix: !!coverUpHint.fixBox } : null}
+            onFixCoverUpBox={() => coverUpHint?.fixBox && setPlacementBox(coverUpHint.fixBox)}
             adjust={adjust}
             onSetAdjust={(patch) => setAdjust((prev) => ({ ...prev, ...patch }))}
             draftAdjust={activePhotoDraftAdjust}

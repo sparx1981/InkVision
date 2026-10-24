@@ -1,4 +1,4 @@
-import { FilesetResolver, ImageSegmenter } from "@mediapipe/tasks-vision";
+import type { ImageSegmenter } from "@mediapipe/tasks-vision";
 
 export function loadImage(src: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
@@ -41,6 +41,8 @@ let segmenterPromise: Promise<ImageSegmenter> | null = null;
 function getSegmenter(): Promise<ImageSegmenter> {
   if (!segmenterPromise) {
     segmenterPromise = (async () => {
+      // Loaded on demand so the (large) MediaPipe bundle stays out of the main chunk.
+      const { FilesetResolver, ImageSegmenter } = await import("@mediapipe/tasks-vision");
       const vision = await FilesetResolver.forVisionTasks(
         "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.20/wasm"
       );
@@ -55,8 +57,22 @@ function getSegmenter(): Promise<ImageSegmenter> {
         outputConfidenceMasks: false
       });
     })();
+    // A failed load (CDN outage, no WebGL) must not be cached forever — let the next call retry.
+    segmenterPromise.catch(() => {
+      segmenterPromise = null;
+    });
   }
   return segmenterPromise;
+}
+
+/**
+ * Starts downloading the segmentation runtime + model in the background (the
+ * first load takes several seconds). Called when a photo is added so the cost
+ * is paid while the person is still choosing a design, not on first Generate.
+ * Never throws — failures surface later, at generation time, as a warning.
+ */
+export function preloadSegmenter(): void {
+  getSegmenter().catch(() => {});
 }
 
 /** Draws `src` onto a canvas at `width`x`height` with a light blur — used both
@@ -331,7 +347,7 @@ function drawImageCover(ctx: CanvasRenderingContext2D, img: HTMLImageElement, wi
  * real, undistorted skin. `drawImageCover` scales it uniformly instead, so
  * whatever gets cropped out keeps its true proportions.
  */
-export async function extractMaskedPatch(baseSrc: string, resultSrc: string, box: Box, skinMask?: HTMLCanvasElement, personMask?: HTMLCanvasElement): Promise<string> {
+export async function extractMaskedPatch(baseSrc: string, resultSrc: string, box: Box, skinMask?: HTMLCanvasElement, personMask?: HTMLCanvasElement, inkMask?: HTMLCanvasElement): Promise<string> {
   const [baseImg, resultImg] = await Promise.all([loadImage(baseSrc), loadImage(resultSrc)]);
   const width = baseImg.naturalWidth || baseImg.width;
   const height = baseImg.naturalHeight || baseImg.height;
@@ -353,7 +369,8 @@ export async function extractMaskedPatch(baseSrc: string, resultSrc: string, box
   // ink. Demoted from a guillotine to a hint with a safety net.
   let useSkin = false;
   let usePerson = !!personMask;
-  if (skinMask || personMask) {
+  let useInk = !!inkMask;
+  if (skinMask || personMask || inkMask) {
     const baseCanvas = document.createElement("canvas");
     baseCanvas.width = width;
     baseCanvas.height = height;
@@ -370,6 +387,10 @@ export async function extractMaskedPatch(baseSrc: string, resultSrc: string, box
       console.log(
         `[QA-CLIP] full-photo skin retention of painted design: ${(retention * 100).toFixed(1)}% -> ${useSkin ? "APPLY skin clip" : "DROP skin clip (box-feather only)"}`
       );
+    }
+    if (inkMask) {
+      useInk = measureSkinRetention(baseCanvas, resultCanvas, invertMaskAlpha(inkMask), boxPx) >= 1 - INK_CLIP_MAX_REMOVAL;
+      console.log(`[QA-CLIP] existing-ink restore: ${useInk ? "APPLY" : "DROP (mask would erase nearly the whole design)"}`);
     }
     if (personMask) {
       const retention = measureSkinRetention(baseCanvas, resultCanvas, personMask, boxPx);
@@ -392,6 +413,13 @@ export async function extractMaskedPatch(baseSrc: string, resultSrc: string, box
   }
   if (useSkin && skinMask) {
     resultCtx.drawImage(skinMask, 0, 0, skinMask.width, skinMask.height, 0, 0, width, height);
+  }
+  // Cover-Up OFF: cut the existing ink out of the patch so the untouched
+  // original shows through there — a pixel-level guarantee, not a request.
+  if (inkMask && useInk) {
+    resultCtx.globalCompositeOperation = "destination-out";
+    resultCtx.drawImage(inkMask, 0, 0, inkMask.width, inkMask.height, 0, 0, width, height);
+    resultCtx.globalCompositeOperation = "source-over";
   }
 
   return resultCanvas.toDataURL("image/png");
@@ -454,6 +482,59 @@ export function computeCropRegion(box: Box, marginFrac = 0.5, maxMarginPct = 12)
   return { x, y, width: right - x, height: bottom - y };
 }
 
+/**
+ * Adjusts a crop region (percent coordinates) so its PIXEL aspect ratio is
+ * exactly one of the ratios the image model can return, while still containing
+ * `box` and staying inside the photo.
+ *
+ * Why: the model only returns a fixed set of aspect ratios, and the result is
+ * later cover-fitted back onto the crop. When the crop's own ratio sits between
+ * two supported ones, cover-fitting trims a slice off one axis — shifting and
+ * rescaling the design relative to the box by a few percent of the frame. Sending
+ * a crop that already has an exact supported ratio removes that mismatch at the
+ * source, using real surrounding photo rather than padding bars.
+ *
+ * Tries the nearest ratios in order and returns the first that can be satisfied;
+ * falls back to the unchanged region if none can (e.g. an extreme box).
+ */
+export function fitRegionToAspect(
+  region: Box,
+  box: Box,
+  photoW: number,
+  photoH: number
+): { region: Box; aspectRatio: string } {
+  const toPx = (b: Box) => ({ x: (b.x / 100) * photoW, y: (b.y / 100) * photoH, w: (b.width / 100) * photoW, h: (b.height / 100) * photoH });
+  const R = toPx(region);
+  const B = toPx(box);
+  const cur = R.w / R.h;
+  const ordered = [...ASPECT_CANDIDATES].sort((a, b) => Math.abs(Math.log(cur / a.value)) - Math.abs(Math.log(cur / b.value)));
+
+  for (const cand of ordered.slice(0, 4)) {
+    const r = cand.value;
+    let w = R.w;
+    let h = R.h;
+    if (w / h < r) w = h * r; // too tall: widen
+    else h = w / r; // too wide: heighten
+    // Too big for the photo? Shrink (never below the box itself).
+    if (w > photoW) { w = photoW; h = w / r; }
+    if (h > photoH) { h = photoH; w = h * r; }
+    if (w < B.w - 0.5 || h < B.h - 0.5) continue;
+    // Centre on the original region, then slide just enough to keep the box inside and the crop on the photo.
+    let x = R.x + R.w / 2 - w / 2;
+    let y = R.y + R.h / 2 - h / 2;
+    x = Math.min(Math.max(x, B.x + B.w - w), B.x);
+    y = Math.min(Math.max(y, B.y + B.h - h), B.y);
+    x = Math.min(Math.max(x, 0), photoW - w);
+    y = Math.min(Math.max(y, 0), photoH - h);
+    if (x > B.x + 0.5 || y > B.y + 0.5 || x + w < B.x + B.w - 0.5 || y + h < B.y + B.h - 0.5) continue;
+    return {
+      region: { x: (x / photoW) * 100, y: (y / photoH) * 100, width: (w / photoW) * 100, height: (h / photoH) * 100 },
+      aspectRatio: cand.label
+    };
+  }
+  return { region, aspectRatio: ordered[0].label };
+}
+
 /** Re-expresses `box` (in full-photo percentage coordinates) as percentage
  * coordinates relative to `cropRegion` instead — used once the base photo
  * has actually been cropped down to just cropRegion, so the corner-bracket
@@ -479,7 +560,7 @@ export function boxRelativeTo(box: Box, cropRegion: Box): Box {
  * extractMaskedPatch, so the result plugs into compositePatchWithAdjust
  * exactly the same way.
  */
-export async function extractCropPatch(baseSrc: string, resultSrc: string, cropRegion: Box, skinMask: HTMLCanvasElement, localBox: Box, personMask?: HTMLCanvasElement): Promise<string> {
+export async function extractCropPatch(baseSrc: string, resultSrc: string, cropRegion: Box, skinMask: HTMLCanvasElement, localBox: Box, personMask?: HTMLCanvasElement, inkMask?: HTMLCanvasElement): Promise<string> {
   const [baseImg, resultImg] = await Promise.all([loadImage(baseSrc), loadImage(resultSrc)]);
   const baseWidth = baseImg.naturalWidth || baseImg.width;
   const baseHeight = baseImg.naturalHeight || baseImg.height;
@@ -529,6 +610,12 @@ export async function extractCropPatch(baseSrc: string, resultSrc: string, cropR
     );
   }
 
+  let useInk = false;
+  if (inkMask) {
+    useInk = measureSkinRetention(baseCropCanvas, patchCanvas, invertMaskAlpha(inkMask), boxPx) >= 1 - INK_CLIP_MAX_REMOVAL;
+    console.log(`[QA-CLIP] existing-ink restore: ${useInk ? "APPLY" : "DROP (mask would erase nearly the whole design)"}`);
+  }
+
   patchCtx.globalCompositeOperation = "destination-in";
   patchCtx.drawImage(buildFeatherMask(pw, ph, localBox), 0, 0);
   // Person silhouette hard clip — see the matching comment in extractMaskedPatch.
@@ -537,6 +624,12 @@ export async function extractCropPatch(baseSrc: string, resultSrc: string, cropR
   }
   if (useSkin) {
     patchCtx.drawImage(skinMask, 0, 0, skinMask.width, skinMask.height, 0, 0, pw, ph);
+  }
+  // Cover-Up OFF: restore the original wherever existing ink was (see extractMaskedPatch).
+  if (inkMask && useInk) {
+    patchCtx.globalCompositeOperation = "destination-out";
+    patchCtx.drawImage(inkMask, 0, 0, inkMask.width, inkMask.height, 0, 0, pw, ph);
+    patchCtx.globalCompositeOperation = "source-over";
   }
 
   const outCanvas = document.createElement("canvas");
@@ -547,6 +640,286 @@ export async function extractCropPatch(baseSrc: string, resultSrc: string, cropR
   outCtx.drawImage(patchCanvas, cropX, cropY, cropW, cropH);
 
   return outCanvas.toDataURL("image/png");
+}
+
+
+// ---------------------------------------------------------------------
+// Existing-ink detection.
+//
+// The generation model is TOLD (in prose) to leave existing tattoos untouched
+// and to cover them in Cover-Up mode, and a before/after check asks another
+// model whether it did. Nothing in the pixels enforced it, and the segmentation
+// model can't help: it labels tattooed skin as skin. This finds the existing ink
+// from the photo itself — pixels clearly darker than the surrounding skin (or
+// distinctly blue/green, as aged ink goes), grouped into blobs so pores, hair
+// and noise don't count — and is used two ways:
+//   * Cover-Up OFF: the original pixels are restored wherever old ink was, so
+//     it is guaranteed untouched whatever the model painted, and the "open
+//     skin" tint shown to the model excludes it.
+//   * Cover-Up ON: the ink's extent is compared with the placement box, so the
+//     person can be told when the new design wouldn't fully cover the old one.
+// It is a heuristic (it keys on darkness against the local skin tone), so every
+// use is guarded: it declines to answer when the result looks implausible.
+// ---------------------------------------------------------------------
+
+export interface ExistingInk {
+  /** Full-size canvas whose alpha marks existing ink (slightly dilated and feathered), or null when detection isn't trustworthy. */
+  mask: HTMLCanvasElement | null;
+  /** Bounds of the ink blobs that touch the placement box (percent of the photo), or null when there are none. */
+  bbox: Box | null;
+  /** True when a touching blob runs to the edge of the analysed neighbourhood, i.e. the tattoo continues beyond `bbox`. */
+  extendsBeyondBbox: boolean;
+  /** Fraction (0-1) of the placement box that is existing ink. */
+  coverage: number;
+  /** Why `mask` is null: nothing found, or the result looked implausible. */
+  reason?: "none" | "unreliable";
+}
+
+// A pixel is ink when it is this much darker than the skin around it. Ink is
+// typically well under half the skin's brightness; ordinary shadow and limb
+// shading stay above ~0.65, so this sits between the two.
+const INK_DARKNESS_RATIO = 0.62;
+// Above this share of the placement box the "ink" is more likely a lighting
+// problem, dark clothing/hair or very dark skin than a tattoo — don't trust it.
+const INK_MAX_BOX_COVERAGE = 0.7;
+// Blobs smaller than this fraction of the analysed area are noise (pores, hairs, specks).
+const INK_MIN_BLOB_FRACTION = 0.0015;
+// Mean luminance step across a blob's boundary (on the ~384px analysis image).
+// Crisp ink edges are tens of levels; shadow gradients are a few.
+const INK_MIN_EDGE_CONTRAST = 12;
+// If restoring the old ink would erase more than this share of the newly
+// painted design, the ink mask is almost certainly wrong — drop it.
+const INK_CLIP_MAX_REMOVAL = 0.85;
+
+export async function detectExistingInk(baseSrc: string, box: Box, skinMask?: HTMLCanvasElement): Promise<ExistingInk> {
+  const img = await loadImage(baseSrc);
+  const W = img.naturalWidth || img.width;
+  const H = img.naturalHeight || img.height;
+  const none = (reason: "none" | "unreliable", coverage = 0, bbox: Box | null = null, extendsBeyondBbox = false): ExistingInk => ({
+    mask: null, bbox, extendsBeyondBbox, coverage, reason
+  });
+
+  // Neighbourhood: the box plus a margin, so skin tone has something to be judged against and blobs that run past the box are seen.
+  const bx = (box.x / 100) * W, by = (box.y / 100) * H, bw = (box.width / 100) * W, bh = (box.height / 100) * H;
+  const zx0 = Math.max(0, Math.floor(bx - bw * 0.25)), zy0 = Math.max(0, Math.floor(by - bh * 0.25));
+  const zx1 = Math.min(W, Math.ceil(bx + bw * 1.25)), zy1 = Math.min(H, Math.ceil(by + bh * 1.25));
+  const zw = zx1 - zx0, zh = zy1 - zy0;
+  if (zw < 8 || zh < 8) return none("none");
+
+  const k = Math.min(1, 384 / Math.max(zw, zh));
+  const aw = Math.max(1, Math.round(zw * k)), ah = Math.max(1, Math.round(zh * k));
+  const work = document.createElement("canvas");
+  work.width = aw;
+  work.height = ah;
+  const wctx = work.getContext("2d", { willReadFrequently: true });
+  if (!wctx) return none("none");
+  wctx.drawImage(img, zx0, zy0, zw, zh, 0, 0, aw, ah);
+  const px = wctx.getImageData(0, 0, aw, ah).data;
+  const n = aw * ah;
+
+  const lum = new Float32Array(n);
+  for (let i = 0; i < n; i++) lum[i] = 0.299 * px[i * 4] + 0.587 * px[i * 4 + 1] + 0.114 * px[i * 4 + 2];
+
+  // Reference skin brightness: a high percentile (skin is lighter than ink) of
+  // the pixels the segmenter calls skin, or of the whole neighbourhood when
+  // that mask is missing or covers too little to rely on.
+  let candidates: number[] = [];
+  let maskSkin: Uint8Array | null = null;
+  if (skinMask) {
+    const mc = document.createElement("canvas");
+    mc.width = aw;
+    mc.height = ah;
+    const mctx = mc.getContext("2d", { willReadFrequently: true });
+    if (mctx) {
+      mctx.drawImage(skinMask, (zx0 / W) * skinMask.width, (zy0 / H) * skinMask.height, (zw / W) * skinMask.width, (zh / H) * skinMask.height, 0, 0, aw, ah);
+      const md = mctx.getImageData(0, 0, aw, ah).data;
+      maskSkin = new Uint8Array(n);
+      for (let i = 0; i < n; i++) if (md[i * 4 + 3] > 128) { candidates.push(lum[i]); maskSkin[i] = 1; }
+    }
+    if (candidates.length < n * 0.05) { candidates = []; maskSkin = null; }
+  }
+  if (!candidates.length) {
+    // No usable skin mask: take the warm-toned pixels (skin of any depth is
+    // red-dominant; a wall, floor or black ink is neutral or cool). Without
+    // this, a bright background in the neighbourhood sets the "skin" level far
+    // too high and the whole body reads as ink.
+    for (let i = 0; i < n; i++) {
+      const r = px[i * 4], g = px[i * 4 + 1], b = px[i * 4 + 2];
+      if (r - b >= 25 && r >= g) candidates.push(lum[i]);
+    }
+    if (candidates.length < n * 0.08) candidates = Array.from(lum);
+  }
+  candidates.sort((a, b) => a - b);
+  const refLum = candidates[Math.floor(candidates.length * 0.7)];
+  if (refLum < 50) return none("unreliable"); // too dark to tell ink from skin
+
+  let ink = new Uint8Array(n);
+  for (let i = 0; i < n; i++) {
+    const r = px[i * 4], b = px[i * 4 + 2];
+    const dark = lum[i] < refLum * INK_DARKNESS_RATIO;
+    const bluish = b - r > 20 && lum[i] < refLum * 0.85; // faded black ink drifts blue/green
+    if (dark || bluish) ink[i] = 1;
+  }
+
+  const dilate = (src: Uint8Array, rad: number): Uint8Array => {
+    if (rad <= 0) return src;
+    const tmp = new Uint8Array(n), out = new Uint8Array(n);
+    for (let y = 0; y < ah; y++) for (let x = 0; x < aw; x++) {
+      let v = 0;
+      for (let dx = -rad; dx <= rad && !v; dx++) { const xx = x + dx; if (xx >= 0 && xx < aw && src[y * aw + xx]) v = 1; }
+      tmp[y * aw + x] = v;
+    }
+    for (let y = 0; y < ah; y++) for (let x = 0; x < aw; x++) {
+      let v = 0;
+      for (let dy = -rad; dy <= rad && !v; dy++) { const yy = y + dy; if (yy >= 0 && yy < ah && tmp[yy * aw + x]) v = 1; }
+      out[y * aw + x] = v;
+    }
+    return out;
+  };
+  // Bridge the gaps between linework (so a hatched/outlined tattoo reads as one blob), then drop small blobs.
+  const joined = dilate(ink, Math.max(1, Math.round(aw * 0.012)));
+
+  const label = new Int32Array(n);
+  const blobs: { id: number; area: number; minX: number; minY: number; maxX: number; maxY: number; touchesEdge: boolean; inBox: boolean }[] = [];
+  const bax0 = ((bx - zx0) / zw) * aw, bay0 = ((by - zy0) / zh) * ah;
+  const bax1 = bax0 + (bw / zw) * aw, bay1 = bay0 + (bh / zh) * ah;
+  const stack: number[] = [];
+  for (let start = 0; start < n; start++) {
+    if (!joined[start] || label[start]) continue;
+    const id = blobs.length + 1;
+    const blob = { id, area: 0, minX: aw, minY: ah, maxX: -1, maxY: -1, touchesEdge: false, inBox: false };
+    stack.push(start);
+    label[start] = id;
+    while (stack.length) {
+      const i = stack.pop()!;
+      const x = i % aw, y = (i - x) / aw;
+      blob.area++;
+      if (x < blob.minX) blob.minX = x;
+      if (x > blob.maxX) blob.maxX = x;
+      if (y < blob.minY) blob.minY = y;
+      if (y > blob.maxY) blob.maxY = y;
+      if (x === 0 || y === 0 || x === aw - 1 || y === ah - 1) blob.touchesEdge = true;
+      if (ink[i] && x >= bax0 && x < bax1 && y >= bay0 && y < bay1) blob.inBox = true;
+      if (x > 0 && joined[i - 1] && !label[i - 1]) { label[i - 1] = id; stack.push(i - 1); }
+      if (x < aw - 1 && joined[i + 1] && !label[i + 1]) { label[i + 1] = id; stack.push(i + 1); }
+      if (y > 0 && joined[i - aw] && !label[i - aw]) { label[i - aw] = id; stack.push(i - aw); }
+      if (y < ah - 1 && joined[i + aw] && !label[i + aw]) { label[i + aw] = id; stack.push(i + aw); }
+    }
+    blobs.push(blob);
+  }
+  // Judge blobs on their real ink pixels (the bridging dilation inflates a
+  // handful of freckles into something blob-sized), and on edge sharpness: a
+  // tattoo has crisp boundaries, whereas a shadow or lighting gradient crosses
+  // the darkness threshold smoothly, so its "edge" is only a few levels per pixel.
+  const inkArea = new Float32Array(blobs.length + 1);
+  const edgeSum = new Float32Array(blobs.length + 1);
+  const edgeCount = new Float32Array(blobs.length + 1);
+  for (let y = 0; y < ah; y++) for (let x = 0; x < aw; x++) {
+    const i = y * aw + x;
+    if (!ink[i]) continue;
+    const id = label[i];
+    inkArea[id]++;
+    const nbrs = [x > 0 ? i - 1 : -1, x < aw - 1 ? i + 1 : -1, y > 0 ? i - aw : -1, y < ah - 1 ? i + aw : -1];
+    for (const j of nbrs) {
+      if (j < 0 || ink[j]) continue;
+      // Only count a boundary against neighbouring SKIN. A limb's shadowed rim
+      // against a bright wall is a sharp dark/light step too, but it isn't a
+      // tattoo; against skin, only real ink makes a crisp edge.
+      const skinLike = maskSkin ? maskSkin[j] === 1 : px[j * 4] - px[j * 4 + 2] >= 25 && px[j * 4] >= px[j * 4 + 1];
+      if (!skinLike) continue;
+      edgeSum[id] += Math.abs(lum[j] - lum[i]);
+      edgeCount[id]++;
+    }
+  }
+  const minArea = Math.max(4, n * INK_MIN_BLOB_FRACTION);
+  const keep = new Set(
+    blobs
+      .filter((b) => inkArea[b.id] >= minArea && edgeCount[b.id] > 0 && edgeSum[b.id] / edgeCount[b.id] >= INK_MIN_EDGE_CONTRAST)
+      .map((b) => b.id)
+  );
+  if (!keep.size) return none("none");
+
+  // Final ink = the actually-dark pixels of the kept blobs (not the bridging dilation).
+  const finalInk = new Uint8Array(n);
+  let inBoxInk = 0, boxPixels = 0;
+  for (let y = 0; y < ah; y++) for (let x = 0; x < aw; x++) {
+    const i = y * aw + x;
+    const inside = x >= bax0 && x < bax1 && y >= bay0 && y < bay1;
+    if (inside) boxPixels++;
+    if (ink[i] && keep.has(label[i])) {
+      finalInk[i] = 1;
+      if (inside) inBoxInk++;
+    }
+  }
+  const coverage = boxPixels ? inBoxInk / boxPixels : 0;
+
+  const touching = blobs.filter((b) => keep.has(b.id) && b.inBox);
+  let bbox: Box | null = null;
+  let extendsBeyondBbox = false;
+  if (touching.length) {
+    const minX = Math.min(...touching.map((b) => b.minX)), maxX = Math.max(...touching.map((b) => b.maxX));
+    const minY = Math.min(...touching.map((b) => b.minY)), maxY = Math.max(...touching.map((b) => b.maxY));
+    const toPctX = (v: number) => ((zx0 + (v / aw) * zw) / W) * 100;
+    const toPctY = (v: number) => ((zy0 + (v / ah) * zh) / H) * 100;
+    bbox = { x: toPctX(minX), y: toPctY(minY), width: toPctX(maxX + 1) - toPctX(minX), height: toPctY(maxY + 1) - toPctY(minY) };
+    extendsBeyondBbox = touching.some((b) => b.touchesEdge);
+  }
+
+  if (coverage > INK_MAX_BOX_COVERAGE) return none("unreliable", coverage, bbox, extendsBeyondBbox);
+  if (!inBoxInk && !touching.length) return none("none", coverage, bbox, extendsBeyondBbox);
+
+  // Mask for restoring the original: ink plus a small safety margin, feathered so no hard halo shows.
+  const grown = dilate(finalInk, Math.max(1, Math.round(aw * 0.006)));
+  const small = document.createElement("canvas");
+  small.width = aw;
+  small.height = ah;
+  const sctx = small.getContext("2d");
+  if (!sctx) return none("none", coverage, bbox, extendsBeyondBbox);
+  const sd = sctx.createImageData(aw, ah);
+  for (let i = 0; i < n; i++) {
+    sd.data[i * 4] = sd.data[i * 4 + 1] = sd.data[i * 4 + 2] = 255;
+    sd.data[i * 4 + 3] = grown[i] ? 255 : 0;
+  }
+  sctx.putImageData(sd, 0, 0);
+  const mask = document.createElement("canvas");
+  mask.width = W;
+  mask.height = H;
+  const mctx2 = mask.getContext("2d");
+  if (!mctx2) return none("none", coverage, bbox, extendsBeyondBbox);
+  mctx2.imageSmoothingEnabled = true;
+  mctx2.filter = `blur(${Math.max(1, Math.round(Math.min(W, H) * 0.0015))}px)`;
+  mctx2.drawImage(small, 0, 0, aw, ah, zx0, zy0, zw, zh);
+  return { mask, bbox, extendsBeyondBbox, coverage };
+}
+
+/**
+ * Smallest box with the same aspect ratio as `box` that contains `target` plus
+ * `margin` percentage points on every side, kept inside the photo. Returns null
+ * if it can't fit within the photo (the tattoo is too big for this box shape).
+ * Used by the Cover-Up helper to offer "fit the box to the existing tattoo".
+ */
+export function boxToCover(box: Box, target: Box, margin = 3): Box | null {
+  const tx0 = target.x - margin, ty0 = target.y - margin;
+  const tx1 = target.x + target.width + margin, ty1 = target.y + target.height + margin;
+  const aspect = box.width / box.height;
+  let w = Math.max(tx1 - tx0, (ty1 - ty0) * aspect);
+  let h = w / aspect;
+  if (w > 100 || h > 100) return null;
+  let x = (tx0 + tx1) / 2 - w / 2;
+  let y = (ty0 + ty1) / 2 - h / 2;
+  x = Math.min(Math.max(x, 0), 100 - w);
+  y = Math.min(Math.max(y, 0), 100 - h);
+  return { x, y, width: w, height: h };
+}
+
+/** True when `outer` fully contains `inner` (percent boxes), with `tolerance` points of slack. */
+export function boxContains(outer: Box, inner: Box, tolerance = 0.5): boolean {
+  return (
+    inner.x >= outer.x - tolerance &&
+    inner.y >= outer.y - tolerance &&
+    inner.x + inner.width <= outer.x + outer.width + tolerance &&
+    inner.y + inner.height <= outer.y + outer.height + tolerance
+  );
 }
 
 /**
@@ -586,6 +959,27 @@ export async function trimToContent(src: string): Promise<string> {
   ctx.drawImage(img, 0, 0, W, H);
 
   const { data } = ctx.getImageData(0, 0, W, H);
+
+  // The "padding" colour is whatever the image's border is, not assumed white:
+  // pale designs (whitework, pastels) sit very close to a white background, so
+  // an absolute "near-white = padding" test discards the design itself and
+  // leaves the placement box as the whole untrimmed square. Take the median
+  // opaque border pixel as the background and keep anything that differs from
+  // it by more than a small tolerance.
+  const borderSamples: number[][] = [];
+  const stepB = Math.max(1, Math.floor(Math.max(W, H) / 200));
+  const pushBorder = (x: number, y: number) => {
+    const idx = (y * W + x) * 4;
+    if (data[idx + 3] >= 20) borderSamples.push([data[idx], data[idx + 1], data[idx + 2]]);
+  };
+  for (let x = 0; x < W; x += stepB) { pushBorder(x, 0); pushBorder(x, H - 1); }
+  for (let y = 0; y < H; y += stepB) { pushBorder(0, y); pushBorder(W - 1, y); }
+  const median = (vals: number[]) => vals.slice().sort((a, b) => a - b)[Math.floor(vals.length / 2)] ?? 255;
+  const bg = borderSamples.length
+    ? [median(borderSamples.map((v) => v[0])), median(borderSamples.map((v) => v[1])), median(borderSamples.map((v) => v[2]))]
+    : [255, 255, 255];
+  const CONTENT_TOLERANCE = 14; // summed per-channel difference from the background
+
   let minX = W;
   let maxX = -1;
   let minY = H;
@@ -596,8 +990,8 @@ export async function trimToContent(src: string): Promise<string> {
       const idx = (y * W + x) * 4;
       const a = data[idx + 3];
       if (a < 20) continue; // fully transparent — not content
-      const brightness = (data[idx] + data[idx + 1] + data[idx + 2]) / 3;
-      if (brightness >= 235) continue; // near-white — treated as padding, not content
+      const diff = Math.abs(data[idx] - bg[0]) + Math.abs(data[idx + 1] - bg[1]) + Math.abs(data[idx + 2] - bg[2]);
+      if (diff <= CONTENT_TOLERANCE) continue; // matches the background — padding, not content
       if (x < minX) minX = x;
       if (x > maxX) maxX = x;
       if (y < minY) minY = y;
@@ -786,68 +1180,8 @@ export async function measureDesignBBox(baseSrc: string, finalSrc: string): Prom
 }
 
 /**
- * Burns a subtle translucent tint directly onto a copy of the base photo's
- * pixels, covering cells of a row-major `rows` x `cols` grid over `box` that
- * were classified by the detection pass as either "skin" or "background" (see
- * /api/detect-skin-regions, which now classifies four labels: skin, ink,
- * mixed, background) — which cells get tinted, and what the tint means,
- * depends on Cover-Up mode:
- *
- * - Cover-Up OFF: GREEN marks cells classified "skin" — confirmed open,
- *   untattooed skin, the only safe placement area. "ink", "mixed", and
- *   "background" cells are all left untinted/off-limits.
- * - Cover-Up ON: RED marks cells classified "background" — confirmed to NOT
- *   be part of the person's body at all (wall, furniture, clothing, etc).
- *   Painting over existing ink is the whole point of Cover-Up mode, so "skin"
- *   and "ink" cells are both fair game and stay untinted; only true
- *   background is excluded.
- *
- * This is the visual-grounding counterpart to burnPlacementMarker's corner
- * brackets: instead of asking the blend model to infer skin-vs-ink-vs-
- * background from the photo through text alone, it gets an actual measured,
- * burned-in signal. Previously this only ran for Cover-Up-off, which left
- * Cover-Up-on generations with no grounding at all about where the body
- * actually ends — a likely cause of designs rendering "floating" over
- * background near the edge of a placement box drawn close to the limb's
- * silhouette.
- */
-export async function burnSkinMask(baseSrc: string, box: Box, cells: string[], rows: number, cols: number, coverUp: boolean): Promise<string> {
-  const baseImg = await loadImage(baseSrc);
-  const width = baseImg.naturalWidth || baseImg.width;
-  const height = baseImg.naturalHeight || baseImg.height;
-
-  const canvas = document.createElement("canvas");
-  canvas.width = width;
-  canvas.height = height;
-  const ctx = canvas.getContext("2d");
-  if (!ctx) throw new Error("Could not get 2D canvas context.");
-  ctx.drawImage(baseImg, 0, 0, width, height);
-
-  const boxX = (box.x / 100) * width;
-  const boxY = (box.y / 100) * height;
-  const boxW = (box.width / 100) * width;
-  const boxH = (box.height / 100) * height;
-  const cellW = boxW / cols;
-  const cellH = boxH / rows;
-
-  const targetLabel = coverUp ? "background" : "skin";
-  ctx.fillStyle = coverUp ? "rgba(230, 45, 45, 0.35)" : "rgba(40, 220, 90, 0.35)";
-  for (let r = 0; r < rows; r++) {
-    for (let c = 0; c < cols; c++) {
-      if (cells[r * cols + c] !== targetLabel) continue;
-      ctx.fillRect(boxX + c * cellW, boxY + r * cellH, cellW, cellH);
-    }
-  }
-
-  return canvas.toDataURL("image/jpeg", 0.92);
-}
-
-/**
- * Pixel-precise replacement for `burnSkinMask` above (kept, but no longer
- * called — see getSkinSegmentationMask's comment for why). Burns the same
- * kind of translucent tint, but sourced directly from the real per-pixel
- * segmentation mask instead of a coarse Gemini-graded grid, and clipped to
- * that mask's own boundary rather than filling whole grid cells:
+ * Burns a translucent tint, sourced directly from the real per-pixel
+ * segmentation mask and clipped to that mask's own boundary:
  *
  * - Cover-Up OFF: GREEN over confirmed skin (body-skin/face-skin) inside the
  *   placement box — the only area the new design may be placed.
@@ -860,7 +1194,7 @@ export async function burnSkinMask(baseSrc: string, box: Box, cells: string[], r
  * physically enforced afterward — no mismatch between the hint and the
  * guarantee.
  */
-export async function burnSkinMaskFromSegmentation(baseSrc: string, box: Box, skinMask: HTMLCanvasElement, coverUp: boolean): Promise<string> {
+export async function burnSkinMaskFromSegmentation(baseSrc: string, box: Box, skinMask: HTMLCanvasElement, coverUp: boolean, inkMask?: HTMLCanvasElement): Promise<string> {
   const baseImg = await loadImage(baseSrc);
   const width = baseImg.naturalWidth || baseImg.width;
   const height = baseImg.naturalHeight || baseImg.height;
@@ -886,7 +1220,12 @@ export async function burnSkinMaskFromSegmentation(baseSrc: string, box: Box, sk
   octx.fillRect(boxX, boxY, boxW, boxH);
 
   octx.globalCompositeOperation = "destination-in";
-  octx.drawImage(coverUp ? invertMaskAlpha(skinMask) : skinMask, 0, 0);
+  octx.drawImage(coverUp ? invertMaskAlpha(skinMask) : skinMask, 0, 0, skinMask.width, skinMask.height, 0, 0, width, height);
+  // "Open skin" must not include existing ink, which the segmenter calls skin.
+  if (!coverUp && inkMask) {
+    octx.globalCompositeOperation = "destination-out";
+    octx.drawImage(inkMask, 0, 0, inkMask.width, inkMask.height, 0, 0, width, height);
+  }
 
   ctx.drawImage(overlay, 0, 0);
   return canvas.toDataURL("image/jpeg", 0.92);
@@ -976,6 +1315,24 @@ export async function transformDesignGraphic(
   return canvas.toDataURL("image/png");
 }
 
+/** Output aspect ratios the image model supports (server.ts's allowlist mirrors this). */
+export const ASPECT_CANDIDATES: { label: string; value: number }[] = [
+  { label: "1:1", value: 1 },
+  { label: "1:4", value: 1 / 4 },
+  { label: "1:8", value: 1 / 8 },
+  { label: "2:3", value: 2 / 3 },
+  { label: "3:2", value: 3 / 2 },
+  { label: "3:4", value: 3 / 4 },
+  { label: "4:1", value: 4 / 1 },
+  { label: "4:3", value: 4 / 3 },
+  { label: "4:5", value: 4 / 5 },
+  { label: "5:4", value: 5 / 4 },
+  { label: "8:1", value: 8 / 1 },
+  { label: "9:16", value: 9 / 16 },
+  { label: "16:9", value: 16 / 9 },
+  { label: "21:9", value: 21 / 9 }
+];
+
 /** Get an image's real pixel dimensions and closest supported Gemini aspect-ratio label. */
 export async function getImageOrientation(src: string): Promise<{ width: number; height: number; aspectRatio: string }> {
   const img = await loadImage(src);
@@ -988,22 +1345,7 @@ export async function getImageOrientation(src: string): Promise<{ width: number;
   // mirrors this same list) — wider than the original 5, so an arbitrary phone
   // photo's real proportions land closer to one of these before drawImageCover()
   // has to crop the rest away.
-  const candidates: { label: string; value: number }[] = [
-    { label: "1:1", value: 1 },
-    { label: "1:4", value: 1 / 4 },
-    { label: "1:8", value: 1 / 8 },
-    { label: "2:3", value: 2 / 3 },
-    { label: "3:2", value: 3 / 2 },
-    { label: "3:4", value: 3 / 4 },
-    { label: "4:1", value: 4 / 1 },
-    { label: "4:3", value: 4 / 3 },
-    { label: "4:5", value: 4 / 5 },
-    { label: "5:4", value: 5 / 4 },
-    { label: "8:1", value: 8 / 1 },
-    { label: "9:16", value: 9 / 16 },
-    { label: "16:9", value: 16 / 9 },
-    { label: "21:9", value: 21 / 9 }
-  ];
+  const candidates = ASPECT_CANDIDATES;
   let best = candidates[0];
   let bestDiff = Infinity;
   for (const c of candidates) {

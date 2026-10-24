@@ -10,16 +10,19 @@ service cloud.firestore {
       allow write: if false;
     }
 
-    // Projects can be loaded/saved via the server or read/written directly
+    // Projects hold customers' photos and are reached ONLY through the server
+    // API (/api/projects), which enforces access codes, ownership and rate
+    // limits. No direct client access — with the old open rule anyone could
+    // list, read or overwrite every saved project straight from the browser.
     match /projects/{projectCode} {
-      allow read, write: if true;
+      allow read, write: if false;
     }
 
-    // Portfolio items can be browsed by all; likes can be incremented
+    // Portfolio items can be browsed by all. Creating items and liking them go
+    // through the server (likes are one-per-account and need sign-in).
     match /portfolio/{portfolioId} {
       allow read: if true;
-      allow create: if true;
-      allow update: if request.resource.data.diff(resource.data).affectedKeys().hasOnly(['likes']);
+      allow write: if false;
     }
   }
 }

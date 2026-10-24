@@ -40,6 +40,9 @@ interface TattooControlPanelProps {
 
   coverUp: boolean;
   onToggleCoverUp: () => void;
+  /** Advisory shown in Cover-Up mode when the placement box doesn't enclose the existing tattoo. */
+  coverUpHint?: { message: string; canFix: boolean } | null;
+  onFixCoverUpBox?: () => void;
 
   adjust: DesignAdjust;
   onSetAdjust: (patch: Partial<DesignAdjust>) => void;
@@ -139,6 +142,8 @@ export default function TattooControlPanel({
   onLikePortfolioItem,
   coverUp,
   onToggleCoverUp,
+  coverUpHint,
+  onFixCoverUpBox,
   adjust,
   onSetAdjust,
   draftAdjust,
@@ -629,6 +634,24 @@ export default function TattooControlPanel({
                     ? "Cover-Up Mode is ON — the new design may be placed directly over existing ink."
                     : "Cover-Up Mode is OFF — existing tattoos are strictly preserved; the new design fills empty skin only."}
                 </div>
+                {coverUp && coverUpHint && (
+                  <div
+                    role="status"
+                    className="text-xs mb-4 -mt-2 leading-relaxed rounded-lg px-3 py-2.5"
+                    style={{ background: "rgba(214,160,60,0.1)", border: "1px solid rgba(214,160,60,0.35)", color: "rgba(236,231,224,0.85)" }}
+                  >
+                    {coverUpHint.message}
+                    {coverUpHint.canFix && onFixCoverUpBox && (
+                      <button
+                        onClick={onFixCoverUpBox}
+                        className="block mt-2 underline underline-offset-2 cursor-pointer"
+                        style={{ color: "var(--iv-accent)" }}
+                      >
+                        Enlarge the box to cover it
+                      </button>
+                    )}
+                  </div>
+                )}
 
                 <button
                   onClick={onGenerate}
