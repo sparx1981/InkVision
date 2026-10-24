@@ -156,8 +156,9 @@ function buildIsolatedDesignPrompt(opts: {
   style: string;
   colorPreference: string;
   hasReferenceImage: boolean;
+  coverUp?: boolean;
 }): string {
-  const { bodyPart, theme, description, correction, newTattooPrompt, style, colorPreference, hasReferenceImage } = opts;
+  const { bodyPart, theme, description, correction, newTattooPrompt, style, colorPreference, hasReferenceImage, coverUp = false } = opts;
   const correctionLine = correction && correction.trim() ? ` Additional context from the person: "${correction.trim()}".` : "";
 
   const COLOR_INSTRUCTIONS: Record<string, string> = {
@@ -175,9 +176,23 @@ function buildIsolatedDesignPrompt(opts: {
     ? `\n- CRITICAL COLOR MATCH: the attached reference photo shows the person's actual existing tattoo ink. Study its exact black/gray tone, saturation, and any signs of aging or fading, and match your new design's black/dark tones to that SAME ink tone — do not use a fresh, pure, jet-black. If the requested color preference calls for additional colors (e.g. red, blue) alongside black, only the non-black colors should be fully saturated/new; any black or gray portions of the new design must still match the existing ink's tone exactly, so the final result looks like one continuous, realistically aged piece by the same artist rather than two different tattoos of different ages.`
     : "";
 
+  // Cover-Up mode puts the new piece directly over old ink, which is a
+  // different design problem from filling open skin beside it: a real cover-up
+  // is dense, dark and larger than what it hides, with no light areas or empty
+  // negative space for the old linework to show through. Without this the
+  // design is generated as if it were "next to" the old tattoo, and the blend
+  // step is left to hide old ink under a design that has no coverage to give.
+  const placementIntent = coverUp
+    ? `This design is intended to COVER UP an existing tattoo on a person's ${bodyPart}, so the old ink underneath must not show through. The existing tattoo being covered is themed as: ${theme}. ${description}${correctionLine}
+Cover-up design requirements (these override any conflicting style or color rule below):
+- Dense, high-coverage composition: fill the whole canvas with dark, saturated tones and solid black or deep-color areas. Avoid large empty gaps, thin sparse linework, and delicate light shading — old ink shows through all of those.
+- Keep the overall silhouette large and compact, so it can extend beyond the outline of the old tattoo rather than leaving a rim of old ink exposed.
+- Use strong tonal contrast and heavy blacks/dark mid-tones. Do NOT use white, pastel, or very light colors as fill areas.`
+    : `This design is intended to be added next to an existing tattoo on a person's ${bodyPart}. The existing tattoo work is themed as: ${theme}. ${description}${correctionLine}`;
+
   return `Create a single, isolated tattoo design graphic: ${newTattooPrompt}.
 
-This design is intended to be added next to an existing tattoo on a person's ${bodyPart}. The existing tattoo work is themed as: ${theme}. ${description}${correctionLine}
+${placementIntent}
 
 Style requirements:
 - Render in a ${style} tattoo style.
@@ -338,7 +353,7 @@ app.get("/api/health", (req, res) => {
 // API: creates the Firestore user doc on first sign-in (idempotent — safe to call every login)
 app.post("/api/ensure-user", requireAuth, async (req, res) => {
   try {
-    const user = await ensureUserDoc(req.uid!, req.userEmail || null, null);
+    const user = await ensureUserDoc(req.uid!, req.userEmail || null, null, req.emailVerified === true);
     res.json({ success: true, user });
   } catch (error: any) {
     console.error("ensure-user error:", error);
@@ -629,7 +644,8 @@ app.post("/api/generate-tattoo-design", requireAuth, async (req, res) => {
     prompt,
     style = "fineline blackwork",
     colorPreference = "monochrome",
-    referenceImage
+    referenceImage,
+    coverUp = false
   } = req.body as {
     bodyPart?: string;
     theme?: string;
@@ -639,6 +655,7 @@ app.post("/api/generate-tattoo-design", requireAuth, async (req, res) => {
     style?: string;
     colorPreference?: string;
     referenceImage?: string;
+    coverUp?: boolean;
   };
 
   if (!bodyPart || !theme) {
@@ -688,7 +705,8 @@ app.post("/api/generate-tattoo-design", requireAuth, async (req, res) => {
       newTattooPrompt: prompt,
       style,
       colorPreference,
-      hasReferenceImage: !!referenceImage
+      hasReferenceImage: !!referenceImage,
+      coverUp: coverUp === true
     });
 
     console.log(`Generating ${DESIGN_VARIATION_COUNT} isolated tattoo design variations with prompt:`, fullPrompt);

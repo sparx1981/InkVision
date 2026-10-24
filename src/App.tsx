@@ -940,7 +940,8 @@ export default function App() {
             prompt,
             style,
             colorPreference,
-            referenceImage: activePhoto.src
+            referenceImage: activePhoto.src,
+            coverUp
           })
         });
         const data = await safeJson(res);

@@ -205,6 +205,13 @@ function invertMaskAlpha(maskCanvas: HTMLCanvasElement): HTMLCanvasElement {
 // box-feather clip alone. See measureSkinRetention.
 const SKIN_CLIP_MIN_RETENTION = 0.5;
 
+// Same safety net for the person-silhouette clip. The silhouette is far more
+// reliable than the bare-skin class, but it is still a segmentation model: on
+// a tight close-up of a limb with no head/torso in frame it can classify the
+// whole photo as background, and an unconditional clip would then erase the
+// entire design (the user sees the design "vanish" with no explanation).
+const PERSON_CLIP_MIN_RETENTION = 0.5;
+
 /**
  * Estimates what fraction of the newly-painted design (inside `boxPx`, in the
  * result canvas's own pixels) the `skinMask` would KEEP if applied as a
@@ -345,7 +352,8 @@ export async function extractMaskedPatch(baseSrc: string, resultSrc: string, box
   // unreliable on non-arm body parts and was silently deleting valid on-skin
   // ink. Demoted from a guillotine to a hint with a safety net.
   let useSkin = false;
-  if (skinMask) {
+  let usePerson = !!personMask;
+  if (skinMask || personMask) {
     const baseCanvas = document.createElement("canvas");
     baseCanvas.width = width;
     baseCanvas.height = height;
@@ -356,20 +364,30 @@ export async function extractMaskedPatch(baseSrc: string, resultSrc: string, box
       w: (box.width / 100) * width,
       h: (box.height / 100) * height
     };
-    const retention = measureSkinRetention(baseCanvas, resultCanvas, skinMask, boxPx);
-    useSkin = retention >= SKIN_CLIP_MIN_RETENTION;
-    console.log(
-      `[QA-CLIP] full-photo skin retention of painted design: ${(retention * 100).toFixed(1)}% -> ${useSkin ? "APPLY skin clip" : "DROP skin clip (box-feather only)"}`
-    );
+    if (skinMask) {
+      const retention = measureSkinRetention(baseCanvas, resultCanvas, skinMask, boxPx);
+      useSkin = retention >= SKIN_CLIP_MIN_RETENTION;
+      console.log(
+        `[QA-CLIP] full-photo skin retention of painted design: ${(retention * 100).toFixed(1)}% -> ${useSkin ? "APPLY skin clip" : "DROP skin clip (box-feather only)"}`
+      );
+    }
+    if (personMask) {
+      const retention = measureSkinRetention(baseCanvas, resultCanvas, personMask, boxPx);
+      usePerson = retention >= PERSON_CLIP_MIN_RETENTION;
+      console.log(
+        `[QA-CLIP] full-photo person retention of painted design: ${(retention * 100).toFixed(1)}% -> ${usePerson ? "APPLY person clip" : "DROP person clip (segmentation missed the body)"}`
+      );
+    }
   }
 
   resultCtx.globalCompositeOperation = "destination-in";
   resultCtx.drawImage(buildFeatherMask(width, height, box), 0, 0);
-  // Person silhouette: ALWAYS applied as a hard clip (see getSegmentationMasks).
-  // Safe unconditionally because it only removes pixels outside the body, so it
-  // can never erase a design that landed on the person — it just stops ink on
-  // the background and stops the limb being widened to fill an overhanging box.
-  if (personMask) {
+  // Person silhouette: applied as a hard clip whenever segmentation actually
+  // found the body (see getSegmentationMasks / PERSON_CLIP_MIN_RETENTION). It
+  // only removes pixels outside the body, so on a good segmentation it can
+  // never erase a design that landed on the person — it just stops ink on the
+  // background and stops the limb being widened to fill an overhanging box.
+  if (personMask && usePerson) {
     resultCtx.drawImage(personMask, 0, 0, personMask.width, personMask.height, 0, 0, width, height);
   }
   if (useSkin && skinMask) {
@@ -502,11 +520,19 @@ export async function extractCropPatch(baseSrc: string, resultSrc: string, cropR
   console.log(
     `[QA-CLIP] crop skin retention of painted design: ${(retention * 100).toFixed(1)}% -> ${useSkin ? "APPLY skin clip" : "DROP skin clip (box-feather only)"}`
   );
+  let usePerson = false;
+  if (personMask) {
+    const personRetention = measureSkinRetention(baseCropCanvas, patchCanvas, personMask, boxPx);
+    usePerson = personRetention >= PERSON_CLIP_MIN_RETENTION;
+    console.log(
+      `[QA-CLIP] crop person retention of painted design: ${(personRetention * 100).toFixed(1)}% -> ${usePerson ? "APPLY person clip" : "DROP person clip (segmentation missed the body)"}`
+    );
+  }
 
   patchCtx.globalCompositeOperation = "destination-in";
   patchCtx.drawImage(buildFeatherMask(pw, ph, localBox), 0, 0);
   // Person silhouette hard clip — see the matching comment in extractMaskedPatch.
-  if (personMask) {
+  if (personMask && usePerson) {
     patchCtx.drawImage(personMask, 0, 0, personMask.width, personMask.height, 0, 0, pw, ph);
   }
   if (useSkin) {

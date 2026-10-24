@@ -7,6 +7,7 @@ declare global {
     interface Request {
       uid?: string;
       userEmail?: string;
+      emailVerified?: boolean;
     }
   }
 }
@@ -25,6 +26,7 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
     const decoded = await authAdmin.verifyIdToken(token);
     req.uid = decoded.uid;
     req.userEmail = decoded.email;
+    req.emailVerified = decoded.email_verified === true;
     next();
   } catch (err) {
     console.error("Token verification failed:", err);
@@ -44,6 +46,7 @@ export async function optionalAuth(req: Request, res: Response, next: NextFuncti
     const decoded = await authAdmin.verifyIdToken(token);
     req.uid = decoded.uid;
     req.userEmail = decoded.email;
+    req.emailVerified = decoded.email_verified === true;
   } catch {
     // invalid/expired token on an optional route — just proceed unauthenticated
   }

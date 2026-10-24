@@ -46,11 +46,14 @@ function isPeriodExpired(periodStart: string): boolean {
 }
 
 /** Fetches a user's doc, creating it with sensible defaults on their very first authenticated request. */
-export async function ensureUserDoc(uid: string, email: string | null, displayName: string | null): Promise<UserDoc> {
+export async function ensureUserDoc(uid: string, email: string | null, displayName: string | null, emailVerified = false): Promise<UserDoc> {
   if (!db) throw new Error("Firestore is not configured.");
   const ref = db.collection("users").doc(uid);
   const snap = await ref.get();
-  const isAdminEmail = !!email && ADMIN_EMAILS.includes(email.toLowerCase());
+  // Only a VERIFIED email can be promoted: an email/password sign-up can claim
+  // any address without proving ownership, which would otherwise hand the
+  // admin role to whoever registers an ADMIN_EMAILS address first.
+  const isAdminEmail = !!email && emailVerified && ADMIN_EMAILS.includes(email.toLowerCase());
 
   if (snap.exists) {
     const existing = snap.data() as UserDoc;
