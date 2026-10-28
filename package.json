@@ -9,7 +9,7 @@
     "preview": "vite preview",
     "clean": "rm -rf dist server.js projects-db.json",
     "lint": "tsc --noEmit",
-    "test:unit": "tsx --test qa/geometry.test.ts",
+    "test:unit": "tsx --test qa/geometry.test.ts qa/dbfallback.test.ts",
     "test:server": "node qa/server/build.mjs && node qa/server/run.cjs",
     "test": "npm run test:unit && npm run test:server"
   },

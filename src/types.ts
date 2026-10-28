@@ -118,4 +118,6 @@ export interface SavedProject {
 
   createdAt?: string;
   updatedAt?: string;
+  /** Small preview image for the saved-projects list. */
+  thumbnail?: string | null;
 }

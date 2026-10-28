@@ -60,6 +60,29 @@ app.set("trust proxy", 1);
 // (the AI routes take one or two downscaled images) gets a much smaller cap so
 // an unauthenticated or abusive caller can't make the server buffer tens of MB
 // per request. Order matters: the first matching parser consumes the body.
+//
+// Two cheap guards run BEFORE any body is parsed, because parsing a multi-MB
+// base64 JSON body is the single most expensive thing this server does and, on
+// serverless billing, it is CPU time that is paid for whether or not the caller
+// is legitimate:
+//   1. a generous per-IP ceiling on all API traffic;
+//   2. routes that need a signed-in user are rejected on a missing
+//      Authorization header without reading the body at all (the token itself
+//      is still verified later, by requireAuth).
+const apiFloodLimiter = rateLimit({ windowMs: 60_000, max: 300, by: "ip", label: "API" });
+const NEEDS_AUTH_HEADER = [
+  /^\/api\/(analyze-tattoo|composite-photorealistic|verify-tattoo-result|suggest-tattoo-ideas|generate-reference-sheet|generate-tattoo-design)$/,
+  /^\/api\/portfolio\/[^/]+\/like$/,
+  /^\/api\/admin\//,
+  /^\/api\/create-(checkout|billing-portal)-session$/
+];
+app.use("/api", apiFloodLimiter);
+app.use("/api", (req, res, next) => {
+  if (req.method !== "GET" && !(req.headers.authorization || "").startsWith("Bearer ") && NEEDS_AUTH_HEADER.some((re) => re.test(req.originalUrl.split("?")[0]))) {
+    return res.status(401).json({ error: "Sign in required." });
+  }
+  next();
+});
 app.use("/api/projects", express.json({ limit: "80mb" }));
 app.use(express.json({ limit: "25mb" }));
 app.use(express.urlencoded({ limit: "1mb", extended: true }));
@@ -391,10 +414,23 @@ app.get("/api/health", (req, res) => {
 });
 
 // API: creates the Firestore user doc on first sign-in (idempotent — safe to call every login)
+// Builds the profile shape the client shows (tier, role, usage this period).
+async function profileFor(uid: string, user: any) {
+  const allowance = await checkGenerationAllowance(uid);
+  return {
+    tier: user.tier,
+    role: user.role,
+    generationsThisPeriod: allowance.used,
+    generationLimit: allowance.limit
+  };
+}
+
+// API: creates the Firestore user doc on first sign-in (idempotent — safe to call every login).
+// Also returns the profile, so the client needs ONE request per page load, not two.
 app.post("/api/ensure-user", requireAuth, async (req, res) => {
   try {
     const user = await ensureUserDoc(req.uid!, req.userEmail || null, null, req.emailVerified === true);
-    res.json({ success: true, user });
+    res.json({ success: true, user, profile: await profileFor(req.uid!, user) });
   } catch (error: any) {
     console.error("ensure-user error:", error);
     res.status(500).json({ error: error.message || "Failed to set up your account." });
@@ -406,16 +442,7 @@ app.get("/api/me", requireAuth, async (req, res) => {
   try {
     const user = await getUserDoc(req.uid!);
     if (!user) return res.status(404).json({ error: "Account not found." });
-    const allowance = await checkGenerationAllowance(req.uid!);
-    res.json({
-      success: true,
-      profile: {
-        tier: user.tier,
-        role: user.role,
-        generationsThisPeriod: allowance.used,
-        generationLimit: allowance.limit
-      }
-    });
+    res.json({ success: true, profile: await profileFor(req.uid!, user) });
   } catch (error: any) {
     console.error("me endpoint error:", error);
     res.status(500).json({ error: error.message || "Failed to load your account." });
@@ -704,8 +731,6 @@ app.post("/api/generate-tattoo-design", requireAuth, aiLimiter, async (req, res)
       coverUp: coverUp === true
     });
 
-    console.log(`Generating ${DESIGN_VARIATION_COUNT} isolated tattoo design variations with prompt:`, fullPrompt);
-
     const parts: any[] = [];
     if (referenceImage) {
       const ref = parseDataUrl(referenceImage);
@@ -836,8 +861,6 @@ app.post("/api/composite-photorealistic", requireAuth, aiLimiter, async (req, re
       skinMaskApplied: !!skinMaskApplied,
       designIsPreIsolated: designIsPreIsolated !== false
     });
-
-    console.log("Generating photorealistic blend with prompt:", fullPrompt);
 
     const response = await generateContentWithRetry(ai, {
       model: "gemini-3.1-flash-lite-image",
@@ -1243,17 +1266,27 @@ function likerFingerprint(itemId: string, uid: string): string {
   return createHash("sha256").update(`${itemId}:${uid}`).digest("hex").slice(0, 24);
 }
 
+// The portfolio is the same for everyone and changes rarely, but each read pulls
+// up to 200 documents (with their images) out of Firestore. Keep one copy in
+// memory briefly, and let the CDN hold it too (s-maxage), so a page full of
+// visitors costs a handful of function runs instead of one each.
+const PORTFOLIO_CACHE_MS = 60_000;
+let portfolioCache: { at: number; items: any[] } | null = null;
+
 app.get("/api/portfolio", async (req, res) => {
   try {
-    if (!firestoreDb) throw new Error("Firestore is not configured.");
-    const snap = await firestoreDb.collection("portfolio").limit(200).get();
-    const items = snap.docs.map((doc: any) => publicPortfolioItem(doc.data()));
-
-    const sorted = [...items].sort((a, b) => {
-      if (b.likes !== a.likes) return b.likes - a.likes;
-      return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
-    });
-    res.json({ success: true, items: sorted });
+    if (!portfolioCache || Date.now() - portfolioCache.at > PORTFOLIO_CACHE_MS) {
+      if (!firestoreDb) throw new Error("Firestore is not configured.");
+      const snap = await firestoreDb.collection("portfolio").limit(200).get();
+      const items = snap.docs.map((doc: any) => publicPortfolioItem(doc.data()));
+      items.sort((a: any, b: any) => {
+        if (b.likes !== a.likes) return b.likes - a.likes;
+        return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+      });
+      portfolioCache = { at: Date.now(), items };
+    }
+    res.setHeader("Cache-Control", "public, s-maxage=300, stale-while-revalidate=600");
+    res.json({ success: true, items: portfolioCache.items });
   } catch (error: any) {
     console.error("Portfolio List Error:", error);
     res.status(500).json({ error: "Failed to load the portfolio." });
@@ -1282,6 +1315,7 @@ app.post("/api/portfolio/:id/like", requireAuth, likeLimiter, async (req, res) =
 
     const updated = { ...data, likes: (data.likes || 0) + 1, likedBy: [...likedBy, fingerprint] };
     await docRef.update({ likes: updated.likes, likedBy: updated.likedBy });
+    portfolioCache = null; // next list read reflects the new count
     res.json({ success: true, alreadyLiked: false, item: publicPortfolioItem(updated) });
   } catch (error: any) {
     console.error("Portfolio Like Error:", error);
@@ -1373,24 +1407,30 @@ app.post("/api/projects", optionalAuth, projectWriteLimiter, async (req, res) =>
 app.get("/api/my-projects", requireAuth, async (req, res) => {
   try {
     if (!firestoreDb) throw new Error("Firestore is not configured.");
+    // Only the fields the list shows are fetched (select). Whole project
+    // documents carry several base64 photos each, so reading 100 of them just
+    // to list names and thumbnails moved tens of MB per open of "Load Project".
     // Sorting here (rather than via .orderBy in the query) avoids needing a
     // Firestore composite index for this where+orderBy combination.
-    const snap = await firestoreDb.collection("projects").where("ownerUid", "==", req.uid).limit(100).get();
+    const snap = await firestoreDb
+      .collection("projects")
+      .where("ownerUid", "==", req.uid)
+      .select("code", "name", "updatedAt", "thumbnail")
+      .limit(100)
+      .get();
     const projects = snap.docs
-      .map((d) => {
+      .map((d: any) => {
         const data = d.data();
         return {
           code: data.code,
           name: data.name || "Untitled Project",
           updatedAt: data.updatedAt,
-          thumbnail:
-            (data.angleResults && Object.values(data.angleResults)[0] && (Object.values(data.angleResults)[0] as any).src) ||
-            data.design?.src ||
-            data.basePhotos?.[0]?.src ||
-            null
+          // Saved projects carry a small thumbnail (added at save time); projects
+          // saved before that existed simply show no thumbnail until re-saved.
+          thumbnail: data.thumbnail || null
         };
       })
-      .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
+      .sort((a: any, b: any) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
       .slice(0, 50);
     res.json({ success: true, projects });
   } catch (error: any) {

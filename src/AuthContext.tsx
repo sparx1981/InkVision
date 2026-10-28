@@ -63,7 +63,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           const token = await nextUser.getIdToken();
           // Idempotent — creates the Firestore doc on first sign-in (applying
           // ADMIN_EMAILS promotion if applicable), no-ops otherwise.
-          await fetch("/api/ensure-user", { method: "POST", headers: { Authorization: `Bearer ${token}` } });
+          // One request does both: creates the account doc on first sign-in and returns the profile.
+          const res = await fetch("/api/ensure-user", { method: "POST", headers: { Authorization: `Bearer ${token}` } });
+          if (res.ok) {
+            const data = await res.json();
+            if (data.profile) {
+              setProfile(data.profile);
+              return;
+            }
+          }
         } catch (err) {
           console.error("Error ensuring user doc:", err);
         }

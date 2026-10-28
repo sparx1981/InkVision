@@ -53,6 +53,19 @@ Date: 2026-10-24 · Branch: `ccr-59ea2167-skkbdl`
 ### UI
 - The navigation (Studio / Portfolio / Pricing) now shows on phones. The title and footer no longer touch the screen edges at 375 px.
 
+## CPU use (Vercel "Fluid Active CPU")
+
+Vercel paused the whole Sparx team (all 8 projects) for exceeding the Hobby plan's CPU limit. Runtime logs on Hobby cover only the last hour, so I couldn't see which project or route used the CPU. These are the places in InkVision's code that burn CPU or move large payloads, and what I changed:
+
+- **Database wrapper wrote everything to disk on every save.** `dbFallback.ts` saved the whole local copy first, even with live Firestore: it pretty-printed every document written so far (base64 photos included) on each write and kept them all in memory. It now writes to the real database and only keeps a local copy when that fails or doesn't exist. Measured on 25 saves of a ~3 MB project: 5,588 ms CPU and 201 MB RSS before, 4 ms and 93 MB after.
+- **Heavy bodies are rejected before they're parsed.** Routes that need sign-in return 401 on a missing `Authorization` header without reading the body, and all `/api` traffic has a 300-requests-a-minute per-IP ceiling before any parsing.
+- **Portfolio list is cached.** It's cached in memory for 60 s and told to the CDN (`s-maxage=300`), instead of reading up to 200 documents per visit. It's also no longer fetched on every page load, only when the portfolio is opened.
+- **One account request per page load.** `/api/ensure-user` now returns the profile, so the client no longer calls `/api/me` straight after.
+- **"Load Project" no longer reads whole projects.** The list fetches only name, date and a small thumbnail (saved with the project from now on). Older projects show no thumbnail until re-saved.
+- **Smaller log lines.** The full prompt is no longer logged on every generation.
+
+What I can't tell without usage data: whether InkVision was the project that used the CPU. In the Vercel dashboard, Usage broken down by project will show it. Other likely candidates are `reposhelf` and `polyform-mcp`, which run scheduled or agent traffic.
+
 ## Deploying
 1. Deploy the app first.
 2. Then deploy `firestore.rules` (for example `firebase deploy --only firestore:rules`, with your named database configured). Deploying the rules before the new client is live would break project load and save and portfolio likes for anyone on the old version.

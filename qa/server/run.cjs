@@ -90,6 +90,25 @@ const srv = app.listen(3111, async () => {
   t("portfolio list hides likedBy, shows likes=2", pl.s === 200 && pl.j.items[0].likes === 2 && !("likedBy" in pl.j.items[0]), JSON.stringify(pl.j));
   t("like unknown design -> 404", (await call("POST","/api/portfolio/nope/like",{token:alice})).s === 404);
 
+  // --- CPU guards: cheap rejections and caching
+  const bigNoToken = '{"images":["data:image/png;base64,' + "A".repeat(20_000_000) + '"]}';
+  const rj = await call("POST","/api/composite-photorealistic",{body:bigNoToken});
+  t("20MB body, no token -> 401 without parsing it (not 413/400)", rj.s === 401, rj.s);
+  t("like without Authorization header -> 401 pre-parse", (await call("POST","/api/portfolio/pf-1/like",{body:{}})).s === 401);
+  t("portfolio list is CDN-cacheable", /s-maxage=300/.test(pl.h.get("cache-control") || ""), pl.h.get("cache-control"));
+  const pl2 = await call("GET","/api/portfolio");
+  t("portfolio list served consistently from cache", pl2.s === 200 && pl2.j.items[0].likes === 2);
+  const lk4 = await call("POST","/api/portfolio/pf-1/like",{token:"carol|c@x.com|1"});
+  const pl3 = await call("GET","/api/portfolio");
+  t("a new like invalidates the cached list", lk4.s === 200 && pl3.j.items[0].likes === 3, JSON.stringify(pl3.j));
+  const eu = await call("POST","/api/ensure-user",{token:alice});
+  t("ensure-user also returns the profile (one request per page load)", eu.s === 200 && eu.j.profile && eu.j.profile.tier === "free" && eu.j.profile.generationLimit === 1, JSON.stringify(eu.j));
+  const withThumb = await call("POST","/api/projects",{token:alice,body:{name:"thumbed",thumbnail:"data:image/jpeg;base64,/9j/AAAA",basePhotos:[{src:"data:image/jpeg;base64,"+"B".repeat(50000)}]}});
+  const list = await call("GET","/api/my-projects",{token:alice});
+  const row = list.j.projects.find(p => p.code === withThumb.j.code);
+  t("project list returns the thumbnail", !!row && row.thumbnail === "data:image/jpeg;base64,/9j/AAAA", JSON.stringify(row));
+  t("project list rows carry no photos", row && !("basePhotos" in row));
+
   // --- admin promotion needs a verified email
   const unv = await call("POST","/api/ensure-user",{token:"mal|craigtrickett@gmail.com|0"});
   t("unverified admin-email account is NOT admin", unv.s === 200 && unv.j.user.role === "consumer", JSON.stringify(unv.j));

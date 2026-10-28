@@ -541,10 +541,6 @@ export default function App() {
     }
   };
 
-  useEffect(() => {
-    fetchPortfolio();
-  }, []);
-
   const handleSetActiveTab = (tab: DesignSourceMode) => {
     setActiveTab(tab);
     if (tab === "portfolio") fetchPortfolio();
@@ -1351,7 +1347,19 @@ export default function App() {
       // The server decides the access code (and checks ownership): it keeps the
       // current code when this project is yours (or anonymous), and issues a
       // fresh one for a new project or one that belongs to someone else.
+      // A small preview for the "Load Project" list, so listing projects never
+      // has to read the full (multi-photo) documents.
+      const thumbSource = (Object.values(angleResults)[0] as AngleResult | undefined)?.src || design.src || basePhotos[0]?.src || null;
+      let thumbnail: string | null = null;
+      if (thumbSource) {
+        try {
+          thumbnail = await downscaleForUpload(thumbSource, 160, 0.7);
+        } catch {
+          thumbnail = null;
+        }
+      }
       const payload: SavedProject = {
+        thumbnail,
         code: projectCode || undefined,
         name: projectName,
         basePhotos,

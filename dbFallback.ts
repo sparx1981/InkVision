@@ -84,6 +84,7 @@ class HybridCollectionReference {
   private orderField: string | null = null;
   private orderDirection: "asc" | "desc" = "asc";
   private limitCount: number | null = null;
+  private selectFields: string[] | null = null;
 
   constructor(private realDb: any, private collectionName: string) {}
 
@@ -97,6 +98,7 @@ class HybridCollectionReference {
     ref.orderField = this.orderField;
     ref.orderDirection = this.orderDirection;
     ref.limitCount = this.limitCount;
+    ref.selectFields = this.selectFields;
     return ref;
   }
 
@@ -106,6 +108,7 @@ class HybridCollectionReference {
     ref.orderField = field;
     ref.orderDirection = direction;
     ref.limitCount = this.limitCount;
+    ref.selectFields = this.selectFields;
     return ref;
   }
 
@@ -115,6 +118,18 @@ class HybridCollectionReference {
     ref.orderField = this.orderField;
     ref.orderDirection = this.orderDirection;
     ref.limitCount = n;
+    ref.selectFields = this.selectFields;
+    return ref;
+  }
+
+  /** Fetch only these fields (real Firestore). Lets a listing skip huge fields such as base64 photos. */
+  select(...fields: string[]) {
+    const ref = new HybridCollectionReference(this.realDb, this.collectionName);
+    ref.filters = this.filters;
+    ref.orderField = this.orderField;
+    ref.orderDirection = this.orderDirection;
+    ref.limitCount = this.limitCount;
+    ref.selectFields = fields;
     return ref;
   }
 
@@ -130,6 +145,9 @@ class HybridCollectionReference {
         }
         if (this.limitCount !== null) {
           realQuery = realQuery.limit(this.limitCount);
+        }
+        if (this.selectFields) {
+          realQuery = realQuery.select(...this.selectFields);
         }
         const snap = await realQuery.get();
         return snap;
@@ -211,124 +229,70 @@ class HybridDocumentReference {
     return new FallbackDocumentSnapshot(this.docId, data !== undefined, data);
   }
 
-  async set(data: any, options?: any) {
-    let localSuccess = false;
-    
-    // Save locally first
-    let dataMap: Record<string, any> = {};
-    let dbFile = "";
-    if (this.collectionName === "users") {
-      dataMap = usersDb;
-      dbFile = USERS_FILE;
-    } else if (this.collectionName === "projects") {
-      dataMap = projectsDb;
-      dbFile = PROJECTS_FILE;
-    } else if (this.collectionName === "portfolio") {
-      dataMap = portfolioDb;
-      dbFile = PORTFOLIO_FILE;
-    }
+  /** The in-memory map + backing file for this collection, if it is one the local fallback knows about. */
+  private local(): { dataMap: Record<string, any>; dbFile: string } | null {
+    if (this.collectionName === "users") return { dataMap: usersDb, dbFile: USERS_FILE };
+    if (this.collectionName === "projects") return { dataMap: projectsDb, dbFile: PROJECTS_FILE };
+    if (this.collectionName === "portfolio") return { dataMap: portfolioDb, dbFile: PORTFOLIO_FILE };
+    return null;
+  }
 
-    if (dbFile) {
-      if (options?.merge && dataMap[this.docId]) {
-        dataMap[this.docId] = { ...dataMap[this.docId], ...data };
+  // Writes go to the real Firestore first and only touch the local copy when
+  // the real database is unavailable (or the write to it failed). They used to
+  // write the local copy FIRST on every call: serialising the whole collection
+  // (pretty-printed, base64 photos included) to disk and keeping every document
+  // ever written in this process's memory — pure waste, and a steady CPU/memory
+  // drain on a serverless host, when the real database is working fine.
+  private async writeReal(label: string, op: () => Promise<unknown>): Promise<boolean> {
+    if (forceLocalFallback || !this.realDb) return false;
+    try {
+      await op();
+      return true;
+    } catch (err: any) {
+      if (err?.message?.includes("PERMISSION_DENIED") || err?.code === 7) {
+        console.warn(`[HybridDB] PERMISSION_DENIED on document ${label} (${this.collectionName}/${this.docId}), switching to local fallback`);
+        forceLocalFallback = true;
       } else {
-        dataMap[this.docId] = data;
+        console.error(`[HybridDB] Error on document ${label} (${this.collectionName}/${this.docId}) on real Firestore:`, err);
       }
-      saveJson(dbFile, dataMap);
-      localSuccess = true;
+      return false;
     }
+  }
 
-    if (!forceLocalFallback && this.realDb) {
-      try {
-        await this.realDb.collection(this.collectionName).doc(this.docId).set(data, options);
-      } catch (err: any) {
-        if (err?.message?.includes("PERMISSION_DENIED") || err?.code === 7) {
-          console.warn(`[HybridDB] PERMISSION_DENIED on document set (${this.collectionName}/${this.docId}), switching to local fallback`);
-          forceLocalFallback = true;
-        } else {
-          console.error(`[HybridDB] Error setting doc (${this.collectionName}/${this.docId}) on real Firestore:`, err);
-        }
-      }
+  async set(data: any, options?: any) {
+    if (await this.writeReal("set", () => this.realDb.collection(this.collectionName).doc(this.docId).set(data, options))) {
+      return true;
     }
-
-    return localSuccess;
+    const local = this.local();
+    if (!local) return false;
+    if (options?.merge && local.dataMap[this.docId]) {
+      local.dataMap[this.docId] = { ...local.dataMap[this.docId], ...data };
+    } else {
+      local.dataMap[this.docId] = data;
+    }
+    saveJson(local.dbFile, local.dataMap);
+    return true;
   }
 
   async update(data: any) {
-    let localSuccess = false;
-
-    // Update locally first
-    let dataMap: Record<string, any> = {};
-    let dbFile = "";
-    if (this.collectionName === "users") {
-      dataMap = usersDb;
-      dbFile = USERS_FILE;
-    } else if (this.collectionName === "projects") {
-      dataMap = projectsDb;
-      dbFile = PROJECTS_FILE;
-    } else if (this.collectionName === "portfolio") {
-      dataMap = portfolioDb;
-      dbFile = PORTFOLIO_FILE;
+    if (await this.writeReal("update", () => this.realDb.collection(this.collectionName).doc(this.docId).update(data))) {
+      return true;
     }
-
-    if (dbFile && dataMap[this.docId]) {
-      dataMap[this.docId] = { ...dataMap[this.docId], ...data };
-      saveJson(dbFile, dataMap);
-      localSuccess = true;
-    }
-
-    if (!forceLocalFallback && this.realDb) {
-      try {
-        await this.realDb.collection(this.collectionName).doc(this.docId).update(data);
-      } catch (err: any) {
-        if (err?.message?.includes("PERMISSION_DENIED") || err?.code === 7) {
-          console.warn(`[HybridDB] PERMISSION_DENIED on document update (${this.collectionName}/${this.docId}), switching to local fallback`);
-          forceLocalFallback = true;
-        } else {
-          console.error(`[HybridDB] Error updating doc (${this.collectionName}/${this.docId}) on real Firestore:`, err);
-        }
-      }
-    }
-
-    return localSuccess;
+    const local = this.local();
+    if (!local || !local.dataMap[this.docId]) return false;
+    local.dataMap[this.docId] = { ...local.dataMap[this.docId], ...data };
+    saveJson(local.dbFile, local.dataMap);
+    return true;
   }
 
   async delete() {
-    let localSuccess = false;
-
-    // Delete locally first
-    let dataMap: Record<string, any> = {};
-    let dbFile = "";
-    if (this.collectionName === "users") {
-      dataMap = usersDb;
-      dbFile = USERS_FILE;
-    } else if (this.collectionName === "projects") {
-      dataMap = projectsDb;
-      dbFile = PROJECTS_FILE;
-    } else if (this.collectionName === "portfolio") {
-      dataMap = portfolioDb;
-      dbFile = PORTFOLIO_FILE;
+    if (await this.writeReal("delete", () => this.realDb.collection(this.collectionName).doc(this.docId).delete())) {
+      return true;
     }
-
-    if (dbFile && dataMap[this.docId]) {
-      delete dataMap[this.docId];
-      saveJson(dbFile, dataMap);
-      localSuccess = true;
-    }
-
-    if (!forceLocalFallback && this.realDb) {
-      try {
-        await this.realDb.collection(this.collectionName).doc(this.docId).delete();
-      } catch (err: any) {
-        if (err?.message?.includes("PERMISSION_DENIED") || err?.code === 7) {
-          console.warn(`[HybridDB] PERMISSION_DENIED on document delete (${this.collectionName}/${this.docId}), switching to local fallback`);
-          forceLocalFallback = true;
-        } else {
-          console.error(`[HybridDB] Error deleting doc (${this.collectionName}/${this.docId}) on real Firestore:`, err);
-        }
-      }
-    }
-
-    return localSuccess;
+    const local = this.local();
+    if (!local || !local.dataMap[this.docId]) return false;
+    delete local.dataMap[this.docId];
+    saveJson(local.dbFile, local.dataMap);
+    return true;
   }
 }
